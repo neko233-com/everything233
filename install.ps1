@@ -23,4 +23,11 @@ if (($userPath -split ';') -notcontains $installDir) {
     [Environment]::SetEnvironmentVariable('Path', ($userPath.TrimEnd(';') + ";$installDir"), 'User')
 }
 
-Write-Host "done. Open a new terminal, then:  everything serve   (or: everything install  for logon auto-start)"
+# register logon auto-start and launch daemon now
+$exe = Join-Path $installDir 'everything.exe'
+if (Test-Path $exe) {
+    & $exe install
+    & $exe serve --background
+}
+
+Write-Host "done. Open a new terminal and use:  everything <query>"

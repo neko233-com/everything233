@@ -62,7 +62,7 @@ impl Index {
             let _ = std::fs::create_dir_all(dir);
         }
         let Ok(mut f) = std::fs::File::create(p) else { return };
-        let _ = f.write_all(&self.names.len().to_le_bytes());
+        let _ = f.write_all(&(self.names.len() as u32).to_le_bytes());
         let _ = f.write_all(&self.names);
         let _ = f.write_all(&(self.recs.len() as u32).to_le_bytes());
         for r in &self.recs {

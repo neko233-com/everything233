@@ -49,7 +49,7 @@ fn current_exe() -> String {
 /// `serve --background`: relaunch detached, then exit.
 fn detach_self() {
     let exe = current_exe();
-    let cmd = format!("\"{exe}\" serve --background");
+    let cmd = format!("\"{exe}\" serve");
     let mut cmdw: Vec<u16> = std::ffi::OsStr::new(&cmd)
         .encode_wide()
         .chain(Some(0))
