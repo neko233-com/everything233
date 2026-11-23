@@ -66,7 +66,11 @@ fn serve_one(pipe: HANDLE, idx: &Shared) {
     if ok == 0 || got == 0 {
         return;
     }
-    let req = String::from_utf8_lossy(&buf[..got as usize]);
+    let units: Vec<u16> = buf[..got as usize]
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    let req = String::from_utf16_lossy(&units);
     let mut parts = req.split('\n');
     let q = parts.next().unwrap_or("").trim().to_string();
     let limit: usize = parts
@@ -89,7 +93,7 @@ fn serve_one(pipe: HANDLE, idx: &Shared) {
     }
     let w = wide(&out);
     let mut sent = 0u32;
-    unsafe { WriteFile(pipe, w.as_ptr() as *const _, w.len() as u32, &mut sent, std::ptr::null_mut()) };
+    unsafe { WriteFile(pipe, w.as_ptr() as *const _, (w.len() * 2) as u32, &mut sent, std::ptr::null_mut()) };
 }
 
 /// Talk to a running daemon. Err => daemon not up; caller falls back to foreground build.
@@ -112,7 +116,7 @@ pub fn client(q: &str, limit: usize, flags: &str) -> io::Result<String> {
     let req = format!("{q}\n{limit}\n{flags}\n");
     let w = wide(&req);
     let mut sent = 0u32;
-    unsafe { WriteFile(h, w.as_ptr() as *const _, w.len() as u32, &mut sent, std::ptr::null_mut()) };
+    unsafe { WriteFile(h, w.as_ptr() as *const _, (w.len() * 2) as u32, &mut sent, std::ptr::null_mut()) };
 
     let mut buf = Vec::new();
     let mut chunk = vec![0u8; 65_536];
@@ -125,5 +129,9 @@ pub fn client(q: &str, limit: usize, flags: &str) -> io::Result<String> {
         buf.extend_from_slice(&chunk[..got as usize]);
     }
     unsafe { CloseHandle(h) };
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    let units: Vec<u16> = buf
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    Ok(String::from_utf16_lossy(&units))
 }

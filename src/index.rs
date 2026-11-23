@@ -5,6 +5,7 @@
 // No content reading, no MFT/USN (needs elevation; roadmap).
 use std::collections::HashMap;
 use std::os::windows::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
@@ -48,6 +49,71 @@ pub struct Index {
 
 pub type Shared = Arc<Mutex<Index>>;
 
+pub fn cache_path() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(|d| {
+        Path::new(&d).join("everything233").join("index.dat")
+    })
+}
+
+impl Index {
+    pub fn save(&self, p: &Path) {
+        use std::io::Write;
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let Ok(mut f) = std::fs::File::create(p) else { return };
+        let _ = f.write_all(&self.names.len().to_le_bytes());
+        let _ = f.write_all(&self.names);
+        let _ = f.write_all(&(self.recs.len() as u32).to_le_bytes());
+        for r in &self.recs {
+            let _ = f.write_all(&r.parent.to_le_bytes());
+            let _ = f.write_all(&r.name.to_le_bytes());
+            let _ = f.write_all(&r.nlen.to_le_bytes());
+            let _ = f.write_all(&r.size.to_le_bytes());
+            let _ = f.write_all(&r.mtime.to_le_bytes());
+            let _ = f.write_all(&[r.is_dir as u8]);
+        }
+        let _ = f.write_all(&(self.watch_path.len() as u32).to_le_bytes());
+        for (k, &v) in &self.watch_path {
+            let kb = k.as_bytes();
+            let _ = f.write_all(&(kb.len() as u32).to_le_bytes());
+            let _ = f.write_all(kb);
+            let _ = f.write_all(&v.to_le_bytes());
+        }
+    }
+
+    pub fn load(p: &Path) -> Option<Self> {
+        use std::io::Read;
+        let mut f = std::fs::File::open(p).ok()?;
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf).ok()?;
+        let mut o = 0usize;
+        let mut rd = |n: usize| -> Option<&[u8]> { let s = o; o += n; Some(&buf[s..o]) };
+        let nl = u32::from_le_bytes(rd(4)?.try_into().ok()?) as usize;
+        let names = rd(nl)?.to_vec();
+        let rc = u32::from_le_bytes(rd(4)?.try_into().ok()?) as usize;
+        let mut recs = Vec::with_capacity(rc);
+        for _ in 0..rc {
+            let parent = u32::from_le_bytes(rd(4)?.try_into().ok()?);
+            let name = u32::from_le_bytes(rd(4)?.try_into().ok()?);
+            let nlen = u32::from_le_bytes(rd(4)?.try_into().ok()?);
+            let size = u64::from_le_bytes(rd(8)?.try_into().ok()?);
+            let mtime = u64::from_le_bytes(rd(8)?.try_into().ok()?);
+            let is_dir = rd(1)?[0] != 0;
+            recs.push(Rec { parent, name, nlen, size, mtime, is_dir });
+        }
+        let wc = u32::from_le_bytes(rd(4)?.try_into().ok()?) as usize;
+        let mut watch_path = HashMap::new();
+        for _ in 0..wc {
+            let kl = u32::from_le_bytes(rd(4)?.try_into().ok()?) as usize;
+            let k = String::from_utf8_lossy(rd(kl)?).into_owned();
+            let v = u32::from_le_bytes(rd(4)?.try_into().ok()?);
+            watch_path.insert(k, v);
+        }
+        Some(Index { recs, names, watch_path })
+    }
+}
+
 impl Index {
     fn push_name(&mut self, s: &str) -> (u32, u32) {
         let off = self.names.len() as u32;
@@ -88,7 +154,7 @@ impl Index {
         parts.reverse();
         let mut path = String::new();
         for p in parts {
-            if path.is_empty() || p.ends_with('\\') {
+            if path.is_empty() || path.ends_with('\\') || p.starts_with('\\') {
                 path.push_str(&p);
             } else {
                 path.push('\\');

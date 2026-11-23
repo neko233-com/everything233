@@ -12,7 +12,8 @@ event-driven watcher (idle CPU ~0 after the initial build).
 ## Features
 
 - `everything <query>` — instant lookup via the resident daemon
-- `everything serve` — build index, watch changes, answer pipe queries
+- `everything serve` — load cached index, watch changes, answer pipe queries; `--rebuild` forces a full rescan
+- Index cache at `%LOCALAPPDATA%\everything233\index.dat` — second start is instant
 - `everything install` / `uninstall` — HKCU Run-key logon auto-start (no admin)
 - Wildcard `*`, `-d` folders only, `-f` files only, `-n <num>` result limit
 - Built-in skips: `.git .svn .hg .jj .vs .idea node_modules Library Temp obj target __pycache__ .gradle .nuget .cache`

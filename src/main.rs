@@ -84,11 +84,21 @@ fn serve(rest: &[String]) -> ! {
     if rest.iter().any(|a| a == "--background") {
         detach_self();
     }
-    eprintln!(
-        "everything v{} building index...",
-        env!("CARGO_PKG_VERSION")
-    );
-    let idx: index::Shared = Arc::new(Mutex::new(index::build()));
+    let rebuild = rest.iter().any(|a| a == "--rebuild");
+    let cache = index::cache_path();
+    eprintln!("everything v{} starting...", env!("CARGO_PKG_VERSION"));
+    let built = match &cache {
+        Some(p) if !rebuild && p.exists() => index::Index::load(p).unwrap_or_default(),
+        _ => {
+            eprintln!("building index (first run, or --rebuild)...");
+            let i = index::build();
+            if let Some(p) = &cache {
+                i.save(p);
+            }
+            i
+        }
+    };
+    let idx: index::Shared = Arc::new(Mutex::new(built));
     eprintln!("indexed {} entries", idx.lock().unwrap().len());
     for root in index::fixed_roots() {
         index::spawn_watch(root, idx.clone());
@@ -137,11 +147,12 @@ fn query(args: &[String]) {
 
 fn print_help() {
     println!(
-        "everything v{} — filename search for Windows (no content scan, no MFT)\n\
+        "everything v{} — filename search for Windows (no content scan)\n\
          \n\
          Usage:\n\
            everything <query>      search via daemon; on-the-fly build if daemon absent\n\
-           everything serve       build index, watch changes, answer pipe queries\n\
+           everything serve        load/build index, watch changes, answer pipe queries\n\
+           everything serve --rebuild   force full rebuild, rewrite cache\n\
            everything install     register daemon at logon (HKCU Run, no admin)\n\
            everything uninstall   unregister daemon\n\
          \n\
