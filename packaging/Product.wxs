@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="everything233" Language="1033" Version="0.1.0"
+           Manufacturer="neko233" UpgradeCode="9b2e3345-5ee5-4a7e-bd0b-130df7bdefc5"
+           Compressed="yes">
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="everything233">
+        <Component Id="MainExecutable" Guid="f0d0fa7d-7908-479e-b608-5387373b5203">
+          <File Id="EverythingExe" Source="target/release/everything.exe" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="MainFeature" Level="1">
+      <ComponentRef Id="MainExecutable" />
+    </Feature>
+  </Package>
+</Wix>
