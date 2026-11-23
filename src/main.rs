@@ -2,6 +2,7 @@ mod daemon;
 mod ignore;
 mod index;
 mod reg;
+mod update;
 
 use std::os::windows::ffi::OsStrExt;
 use std::sync::{Arc, Mutex};
@@ -36,6 +37,7 @@ fn main() {
             Ok(_) => println!("daemon unregistered"),
             Err(e) => eprintln!("unregister failed: {e}"),
         },
+        "update" => update::manual(),
         _ => query(&args),
     }
 }
@@ -85,8 +87,10 @@ fn serve(rest: &[String]) -> ! {
         detach_self();
     }
     let rebuild = rest.iter().any(|a| a == "--rebuild");
+    let auto_update = rest.iter().any(|a| a == "--auto-update");
     let cache = index::cache_path();
     eprintln!("everything v{} starting...", env!("CARGO_PKG_VERSION"));
+    update::auto_check(auto_update);
     let built = match &cache {
         Some(p) if !rebuild && p.exists() => index::Index::load(p).unwrap_or_default(),
         _ => {
@@ -155,6 +159,8 @@ fn print_help() {
            everything serve --rebuild   force full rebuild, rewrite cache\n\
            everything install     register daemon at logon (HKCU Run, no admin)\n\
            everything uninstall   unregister daemon\n\
+           everything update      manual check + fastest-mirror download + elevated install\n\
+           everything serve --auto-update   background check applies update automatically\n\
          \n\
          Options:\n\
            -d           folders only\n\

@@ -15,6 +15,8 @@ event-driven watcher (idle CPU ~0 after the initial build).
 - `everything serve` — load cached index, watch changes, answer pipe queries; `--rebuild` forces a full rescan
 - Index cache at `%LOCALAPPDATA%\everything233\index.dat` — second start is instant
 - `everything install` / `uninstall` — HKCU Run-key logon auto-start (no admin)
+- `everything update` — manual check; probes GitHub mirrors by latency, picks the fastest route, downloads MSI, elevates and installs
+- `everything serve --auto-update` — background check; stages the MSI and applies automatically (UAC)
 - Wildcard `*`, `-d` folders only, `-f` files only, `-n <num>` result limit
 - Built-in skips: `.git .svn .hg .jj .vs .idea node_modules Library Temp obj target __pycache__ .gradle .nuget .cache`
 - Extra skip names: `%APPDATA%\everything233\ignore.txt` (one per line, `#` comment)
