@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
-  <Package Name="everything233" Language="1033" Version="0.5.0"
+  <Package Name="everything233" Language="1033" Version="0.6.0"
            Manufacturer="neko233" UpgradeCode="9b2e3345-5ee5-4a7e-bd0b-130df7bdefc5"
-           Compressed="yes">
+           Scope="perMachine" Compressed="yes">
     <MediaTemplate EmbedCab="yes" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
@@ -16,5 +16,18 @@
     <Feature Id="MainFeature" Level="1">
       <ComponentRef Id="MainExecutable" />
     </Feature>
+
+    <!-- Register the SYSTEM scheduled task on install. Impersonate=yes so the
+         action runs as the (elevated) invoking user: it then publishes the user
+         whitelist into %ProgramData%\everything233 for the SYSTEM daemon. -->
+    <CustomAction Id="InstallDaemon" FileRef="EverythingExe" ExeCommand="install"
+                  Execute="deferred" Impersonate="yes" Return="ignore" />
+    <CustomAction Id="UninstallDaemon" FileRef="EverythingExe" ExeCommand="uninstall"
+                  Execute="deferred" Impersonate="yes" Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="InstallDaemon" After="InstallFiles" Condition="NOT REMOVE" />
+      <Custom Action="UninstallDaemon" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot;" />
+    </InstallExecuteSequence>
   </Package>
 </Wix>

@@ -28,6 +28,15 @@ const BUILTIN: &[&str] = &[
     "build", "out",
 ];
 
+// System trees that must never be entered, matched by NAME at any depth (the
+// USN builder sees names only, so this replaces the old full-path prefixes).
+const SYS: &[&str] = &[
+    "windows", "program files", "program files (x86)", "programdata", "appdata",
+    "$recycle.bin", "system volume information", "recovery", "msocache",
+    "config.msi", "winsxs", "$windows.~bt", "$windows.~ws", "boot",
+    "efi", "perflogs", "intel", "documents and settings",
+];
+
 // Full-path segment prefixes (lowercased) never indexed: OS trees, package caches.
 const PREFIX: &[&str] = &[
     r"\windows\",
@@ -67,10 +76,7 @@ static EXTRA: OnceLock<HashSet<String>> = OnceLock::new();
 fn extra() -> &'static HashSet<String> {
     EXTRA.get_or_init(|| {
         let mut s = HashSet::new();
-        if let Some(dir) = std::env::var_os("APPDATA") {
-            let p = std::path::Path::new(&dir)
-                .join("everything233")
-                .join("ignore.txt");
+        if let Some(p) = crate::index::cfg_file("ignore.txt") {
             if let Ok(txt) = std::fs::read_to_string(p) {
                 for line in txt.lines() {
                     let l = line.trim();
@@ -92,6 +98,16 @@ pub fn is_ignored(name: &str) -> bool {
 /// Data-drive top-level dir to skip entirely (game platforms, caches, temp, backups).
 pub fn top_skipped(name: &str) -> bool {
     TOP_SKIP.contains(&name.to_ascii_lowercase().as_str())
+}
+
+/// Single-call name filter used by the USN builder and live patcher: VCS/build
+/// caches, system trees, and game/cache/backup top-level dirs.
+pub fn skip_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    BUILTIN.contains(&n.as_str())
+        || SYS.contains(&n.as_str())
+        || TOP_SKIP.contains(&n.as_str())
+        || extra().contains(&n)
 }
 
 /// True if any path component (backslash-split) is ignored.

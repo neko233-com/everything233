@@ -11,8 +11,9 @@ voidtools Everything 的 Windows 替代。单文件静态 everything.exe，只�
 
 - Windows-only；静态 CRT（-C target-feature=+crt-static），Windows 无 musl，crt-static 即等价物。
 - 0 抽象：不引框架、不写 trait 层；能用 Windows API / 系统自带工具（curl、msiexec、taskkill）就不写依赖。
-- 不读文件内容；白名单制（见下「扫描范围」），绝不整盘；跳过清单：.git node_modules target Library Temp obj __pycache__ .gradle .nuget .cache，额外读 %APPDATA%\everything233\ignore.txt。
-- 非提权运行；USN/MFT 直读、裸卷访问属 roadmap，不做。
+- 不读文件内容；白名单制（见下「扫描范围」），绝不整盘遍历；跳过清单：.git node_modules target Library Temp obj __pycache__ .gradle .nuget .cache，额外读 %APPDATA%\everything233\ignore.txt。
+- 提权优先：NTFS 卷走 USN 日志直读（`FSCTL_ENUM_USN_DATA` 建索引 + 阻塞式 `FSCTL_READ_USN_JOURNAL` 增量），安装为 SYSTEM 计划任务（schtasks /ru SYSTEM /rl HIGHEST）。拿不到裸卷时回落目录遍历 + 30s 根签名轮询。
+- ReFS/FAT 无法 MFT 枚举（`FSCTL_ENUM_USN_DATA` 返回 ERROR_INVALID_FUNCTION），只能一次性遍历，无增量；这类盘需 `everything serve --rebuild` 才看到新文件。这是文件系统限制，不是实现缺陷。
 
 ## 构建环境（每开新 shell 必设）
 
@@ -27,12 +28,13 @@ VS18 Community 缺 CRT 导入库，只借 BuildTools 的 libcmt/libucrt，link.e
 
 ## 代码结构
 
-- src/main.rs — CLI 分发：serve / install / uninstall / update / query；detach_self 后台分离。
-- src/index.rs — arena 紧凑索引（父子链+名字，命中回溯拼路径）。Shared 无锁：`AtomicPtr<Index>` 发布快照，查询 Acquire 读零锁，重建 `swap` 后 drop 旧代，不用 Mutex/RwLock。build 降线程优先级(BELOW_NORMAL)且每 ~4k 项 yield_now 让出；后台 30s 仅根顶层签名比对，变化才低优先级重建，无常驻变更句柄。
-- 单例：serve 开头 CreateMutexW(`everything233-single`)，`ERROR_ALREADY_EXISTS(183)` 即退出，杜绝双 daemon 翻倍 RSS。
-- src/daemon.rs — 命名管道 \\.\pipe\everything233，请求 query\nlimit\nflags，UTF-16 收发。
-- src/reg.rs — HKCU Run 自注册（无需管理员）。
-- src/ignore.rs — 内置跳过清单 + ignore.txt。
+- src/main.rs — CLI 分发：serve / install / uninstall / update / query / probe / readtest；detach_self 后台分离；plog 同时写 stderr 与 `%ProgramData%\everything233\daemon.log`（SYSTEM 会话无控制台）。
+- src/usn.rs — 裸卷句柄（FILE_FLAG_OVERLAPPED）+ `FSCTL_QUERY_USN_JOURNAL` / `FSCTL_ENUM_USN_DATA` / 异步 `FSCTL_READ_USN_JOURNAL`（事件等待+超时取消 → 空闲 0 CPU）。读盘必须固定 Min/MaxMajorVersion=2：V3 记录是 128 位 FileId，按 V2 解析会解析出 parent=0。增量续读必须用输出缓冲头 8 字节的 USN，不是最后一条记录的 Usn（StartUsn 含端点，用记录 Usn 会无限重读同一条）。
+- src/index.rs — Rec 8B（parent u32: bit31 DIR / bit30 DEAD / 低30 父id；name_id u32）+ 名字链倒排（first/next，解锁只需扫唯一名表 ~65万 而非 400万 记录）+ frn（卷 MFT 号→rec，多卷用 base 偏移）。`Shared = Arc<RwLock<Index>>`：查询并发只读、写锁只在应用增量时短暂持有。build_usn 单遍枚举→邻接表→层序 BFS 套白名单前缀位掩码；build_walk 回退；spawn_usn 每卷一线程 LOWEST 优先级阻塞尾随；每 30s 落一次水位 sidecar。
+- 单例：serve 开头先 `daemon::probe()` 探管道（跨会话，能识别 SYSTEM 会话里的实例），再 CreateMutexW(`everything233-single`) 兜底。
+- src/daemon.rs — 命名管道 \\.\pipe\everything233，请求 query\nlimit\nflags，UTF-16 收发；SDDL `D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;WD)` 让会话 0 的 SYSTEM 服务能被普通用户查询；实例句柄复用（Connect/Disconnect 不重建），重建成环会 100% CPU。
+- src/reg.rs — 提权走 schtasks（SYSTEM+HIGHEST，onstart），非提权回落 HKCU Run。`is_elevated()` 用 `\\.\PHYSICALDRIVE0` 探测：普通用户也能开 `\\.\C:` 只读做 FSCTL_QUERY_USN_JOURNAL，不能用它判管理员。
+- src/ignore.rs — 内置跳过清单 + skip_name（USN 只有名字+父，只能按名字剪）+ ignore.txt。
 - src/update.rs — 手动/自动更新 + 最快镜像路由。
 
 ## 扫描范围（改动前必读）
@@ -43,10 +45,13 @@ VS18 Community 缺 CRT 导入库，只借 BuildTools 的 libcmt/libucrt，link.e
 
 ## 内存布局与索引格式（改动前必读）
 
-- Rec 20B：parent u32（bit31=DIR_BIT 目录标记，低31位=父id，ROOT=0x7FFF_FFFF 为盘符根）、name_id u32、size u64、mtime u32（unix 秒，非 FILETIME）。无 nlen。
-- 名字去重：build 期 seen HashMap 分配 name_id 后 clear+shrink 释放；常驻只留 len(u16)-prefix 紧凑 names blob + name_off 偏移表，重复文件名不重复存字节。
+- Rec 8B：parent u32（bit31=DIR、bit30=DEAD 墓碑、低30=父 rec id，ROOT=0x3FFF_FFFF 为盘符锚点）、name_id u32。**不存 size/mtime**：命中时每条一次 `GetFileAttributesExW`（≤ limit 次调用），省 12B/条。
+- 名字去重：build 期 seen HashMap 分配 name_id 后 clear+shrink；常驻只留 len(u16)-prefix 紧凑 names blob + name_off 偏移表。
+- 名字链倒排：first（name_id→首条 rec+1）、next（rec→同名下一条）。重命名必须把记录重新挂到新名字链（`first[nid]` 头插），否则改名后搜不到；旧链残留用 `rec.name_id != nid` 守卫跳过。
+- frn：卷 MFT 号→rec+1，多卷靠 VolMeta.base 偏移拼接；删除置 DEAD 并清 frn。
 - 构建期不存完整路径；命中才沿 parent 链 resolve。
-- 缓存格式 v3：magic `E233` + version=3 + names blob + name_off 表 + recs（parent/name_id/size/mtime）+ watch_path（空表）。版本不符 load 返回 None，自动重建。
+- 缓存格式 v5：magic `E233` + version=5 + names blob + name_off + recs(8B) + first + next + frn + vol 表（drive u8 / base u32 / journal_id u64 / next_usn i64）。load 校验 `recs.len()==next.len()`、`name_off.len()==first.len()`，不符返回 None 自动重建。
+- 水位 sidecar `%LOCALAPPDATA%\everything233\usn.meta`（`E2UW` + drive/journal/next）：重启时用它补盘外变更，避免重写大缓存；journal 轮转/回绕（journal_id 变或 next_usn < first_usn）直接重新枚举，秒级，别拿旧索引凑合。
 - 遍历死循环红线：内层 FindNextFileW 循环里禁止用 `continue` 跳过该项（会跳过 FindNextFileW 导致同项死循环），用 if 包裹。
 
 ## 更新机制（改动此处前必读）

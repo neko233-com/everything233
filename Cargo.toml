@@ -1,8 +1,8 @@
 [package]
 name = "everything233"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
-description = "Tiny Everything-style filename search for Windows: single static exe, no content scan, skips VCS/build/cache dirs."
+description = "Everything, but faster: elevated USN-journal index (whole volume in seconds), blocking tail (0 idle CPU), 8-byte records, name-chain inverted index."
 license = "MIT"
 repository = "https://github.com/neko233-com/everything233"
 
@@ -17,10 +17,12 @@ windows-sys = { version = "0.59", features = [
   "Win32_Storage_FileSystem",
   "Win32_System_Pipes",
   "Win32_System_IO",
+  "Win32_System_Ioctl",
   "Win32_System_Registry",
   "Win32_System_Threading",
   "Win32_System_Diagnostics_ToolHelp",
   "Win32_System_LibraryLoader",
+  "Win32_Security_Authorization",
 ] }
 
 [profile.release]

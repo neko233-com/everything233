@@ -3,8 +3,10 @@ mod ignore;
 mod index;
 mod reg;
 mod update;
+mod usn;
 
 use std::os::windows::ffi::OsStrExt;
+use std::sync::{Arc, RwLock};
 
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
 use windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW;
@@ -13,9 +15,14 @@ use windows_sys::Win32::System::Threading::{
     STARTUPINFOW,
 };
 
-/// Bail out if another daemon already holds the single-instance mutex.
-/// Prevents a second resident copy doubling RSS (observed 2x123MB).
+/// One daemon only. A SYSTEM task and an interactive shell live in different
+/// sessions, so a local mutex is not enough: probe the pipe first (the pipe
+/// namespace is global), then take the mutex as a same-session backstop.
 fn single_instance() {
+    if daemon::probe() {
+        eprintln!("everything daemon already running; exiting");
+        std::process::exit(0);
+    }
     const ERROR_ALREADY_EXISTS: u32 = 183;
     let name: Vec<u16> = std::ffi::OsStr::new("everything233-single")
         .encode_wide()
@@ -28,7 +35,7 @@ fn single_instance() {
             std::process::exit(0);
         }
     }
-    // Mutex handle stays open for process lifetime; OS releases it on exit.
+    // Handle stays open for process lifetime; the OS releases it on exit.
 }
 
 fn main() {
@@ -46,16 +53,93 @@ fn main() {
         "serve" => serve(&args[1..]),
         "install" => {
             let exe = current_exe();
-            match reg::install_run(&exe) {
-                Ok(_) => println!("daemon registered (HKCU Run): \"{exe}\" serve --background"),
-                Err(e) => eprintln!("register failed: {e}"),
+            if reg::is_elevated() {
+                match reg::install_task(&exe) {
+                    Ok(_) => println!(
+                        "daemon registered: scheduled task '{0}' (SYSTEM, highest) -> \"{1}\" serve",
+                        reg::TASK_NAME, exe
+                    ),
+                    Err(e) => eprintln!("task registration failed: {e}"),
+                }
+            } else {
+                match reg::install_run(&exe) {
+                    Ok(_) => println!(
+                        "daemon registered (HKCU Run, no elevation): \"{exe}\" serve --background\n\
+                         note: run this elevated once to install the SYSTEM task and get USN speed"
+                    ),
+                    Err(e) => eprintln!("register failed: {e}"),
+                }
             }
         }
-        "uninstall" => match reg::uninstall_run() {
-            Ok(_) => println!("daemon unregistered"),
-            Err(e) => eprintln!("unregister failed: {e}"),
-        },
+        "uninstall" => {
+            let _ = reg::uninstall_task();
+            match reg::uninstall_run() {
+                Ok(_) => println!("daemon unregistered"),
+                Err(e) => eprintln!("unregister failed: {e}"),
+            }
+        }
         "update" => update::manual(),
+        "probe" => {
+            for d in ['C', 'D', 'E', 'F'] {
+                let p = format!("{d}:\\");
+                if !std::path::Path::new(&p).exists() {
+                    println!("{d}: no such drive");
+                    continue;
+                }
+                match usn::open(d) {
+                    Some(mut v) => {
+                        let t = std::time::Instant::now();
+                        let mut rootc = 0u32;
+                        let mut maxf = 0u32;
+                        let mut par0 = 0u32;
+                        let mut sample: Vec<(u32, u32, String)> = Vec::new();
+                        let n = v.enumerate(|frn, par, name, _| {
+                            if frn == par {
+                                rootc += 1;
+                            }
+                            if par == 0 {
+                                par0 += 1;
+                            }
+                            maxf = maxf.max(frn).max(par);
+                            if sample.len() < 4 && !name.is_empty() {
+                                sample.push((frn, par, String::from_utf16_lossy(name)));
+                            }
+                        });
+                        println!(
+                            "{d}: {} journal ok id={} enum {n} rootc {rootc} max_frn {maxf} par0 {par0} in {} ms",
+                            usn::fs(d),
+                            v.journal_id,
+                            t.elapsed().as_millis()
+                        );
+                        for s in sample {
+                            println!("   {s:?}");
+                        }
+                    }
+                    None => println!("{d}: journal unavailable"),
+                }
+            }
+        }
+        "readtest" => {
+            let d = args
+                .get(1)
+                .and_then(|s| s.chars().next())
+                .unwrap_or('F');
+            let Some(mut v) = usn::open(d) else {
+                println!("no journal on {d}");
+                return;
+            };
+            println!("{d}: next_usn={}", v.next_usn);
+            for i in 0..3 {
+                let t = std::time::Instant::now();
+                let r = v.read_batch(15);
+                let ms = t.elapsed().as_millis();
+                match r {
+                    Ok(x) => println!("{i}: {ms} ms -> ok {} change(s)", x.len()),
+                    Err(e) => println!("{i}: {ms} ms -> err {e}"),
+                }
+            }
+        }
+        "query" => query(&args[1..]),
         _ => query(&args),
     }
 }
@@ -107,25 +191,126 @@ fn serve(rest: &[String]) -> ! {
     }
     let rebuild = rest.iter().any(|a| a == "--rebuild");
     let auto_update = rest.iter().any(|a| a == "--auto-update");
+    let force_walk = rest.iter().any(|a| a == "--no-usn");
     let cache = index::cache_path();
-    eprintln!("everything v{} starting...", env!("CARGO_PKG_VERSION"));
+    let t0 = std::time::Instant::now();
+    plog(&format!("everything v{} starting", env!("CARGO_PKG_VERSION")));
     update::auto_check(auto_update);
-    let built = match &cache {
-        Some(p) if !rebuild && p.exists() => index::Index::load(p).unwrap_or_default(),
-        _ => {
-            eprintln!("building index (first run, or --rebuild)...");
-            let i = index::build();
+    let roots = index::scan_roots();
+    let loaded = match &cache {
+        Some(p) if !rebuild && p.exists() => {
+            // An empty cache (e.g. whitelist was empty last run) is not "loaded".
+            index::Index::load(p).filter(|i| i.len() > 0)
+        }
+        _ => None,
+    };
+    let mut built = match loaded {
+        Some(i) => {
+            plog(&format!(
+                "loaded cache: {} entries, {} ms",
+                i.len(),
+                t0.elapsed().as_millis()
+            ));
+            i
+        }
+        None => {
+            plog("building index (first run, or --rebuild)");
+            let i = if force_walk {
+                plog("--no-usn: directory walk");
+                index::build_walk(&roots)
+            } else {
+                match index::build_usn(&roots) {
+                    Some(i) => i,
+                    None => {
+                        plog("no USN-capable volume (empty whitelist, journal off, or not elevated); falling back to walk");
+                        index::build_walk(&roots)
+                    }
+                }
+            };
             if let Some(p) = &cache {
-                i.save(p);
+                if i.len() > 0 {
+                    i.save(p);
+                }
             }
+            plog(&format!("build done in {} ms", t0.elapsed().as_millis()));
             i
         }
     };
-    let idx = index::Shared::new(built);
-    eprintln!("indexed {} entries", idx.view().len());
-    index::spawn_poll(idx.clone());
-    eprintln!("serving on \\\\.\\pipe\\everything233");
+    // Sidecar watermarks: replay every change that happened while we were down.
+    if !built.vol.is_empty() {
+        for w in index::load_watermarks() {
+            if let Some(v) = built.vol.iter_mut().find(|m| m.drive == w.drive) {
+                if w.journal_id == v.journal_id && w.next_usn > v.next_usn {
+                    v.next_usn = w.next_usn;
+                }
+            }
+        }
+    }
+
+    // Open the journals. A rotated/wrapped journal cannot replay the gap, so
+    // enumerate again (seconds, not minutes) instead of shipping a stale index.
+    let mut vols = Vec::new();
+    let mut stale = false;
+    for m in built.vol.clone() {
+        if m.journal_id == 0 {
+            continue; // walk-built volume (ReFS/exFAT): nothing to tail
+        }
+        if let Some(mut v) = usn::open(m.drive as char) {
+            if v.journal_id != m.journal_id || m.next_usn < v.first_usn || m.next_usn > v.next_usn {
+                stale = true;
+            } else {
+                v.next_usn = m.next_usn;
+            }
+            vols.push(v);
+        }
+    }
+    if !force_walk && stale {
+        plog("journal rotated or wrapped; rebuilding from enumeration");
+        if let Some(fresh) = index::build_usn(&roots) {
+            if let Some(p) = &cache {
+                fresh.save(p);
+            }
+            built = fresh;
+            vols.clear();
+            for m in &built.vol {
+                if let Some(v) = usn::open(m.drive as char) {
+                    vols.push(v);
+                }
+            }
+        }
+    }
+
+    let idx: index::Shared = Arc::new(RwLock::new(built));
+    plog(&format!("indexed {} entries", idx.read().unwrap().len()));
+    let has_walk = idx.read().unwrap().vol.iter().any(|m| m.journal_id == 0);
+    if vols.is_empty() {
+        plog("watcher: 30s root-signature poll");
+        index::spawn_poll(idx.clone());
+    } else {
+        plog("journal tail active (blocking read, 0 idle CPU)");
+        index::spawn_usn(idx.clone(), vols);
+    }
+    if has_walk {
+        plog("note: non-NTFS volume (ReFS/exFAT) has no MFT enumeration; run `everything serve --rebuild` to pick up new files");
+    }
+    plog("serving on \\\\.\\pipe\\everything233");
     daemon::run(idx)
+}
+
+/// Serve diagnostics must survive the SYSTEM task (session 0 has no console).
+fn plog(msg: &str) {
+    use std::io::Write;
+    eprintln!("{msg}");
+    let Some(base) = std::env::var_os("ProgramData") else { return };
+    let dir = std::path::Path::new(&base).join("everything233");
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("daemon.log"))
+    {
+        let _ = writeln!(f, "{msg}");
+    }
 }
 
 fn query(args: &[String]) {
@@ -172,12 +357,17 @@ fn print_help() {
          \n\
          Usage:\n\
            everything <query>      search via daemon; on-the-fly build if daemon absent\n\
-           everything serve        load/build index, answer pipe queries (30s light refresh)\n\
-           everything serve --rebuild   force full rebuild, rewrite cache\n\
-           everything install     register daemon at logon (HKCU Run, no admin)\n\
-           everything uninstall   unregister daemon\n\
-           everything update      manual check + fastest-mirror download + elevated install\n\
-           everything serve --auto-update   background check applies update automatically\n\
+           everything serve        load/build index, answer pipe queries\n\
+           everything serve --rebuild     force a full rebuild (USN enumeration)\n\
+           everything serve --no-usn      force the directory-walk builder\n\
+           everything install      register daemon: SYSTEM scheduled task when elevated\n\
+           everything uninstall    remove task + Run-key entry\n\
+           everything update       manual check + fastest-mirror download + elevated install\n\
+         \n\
+         Index:\n\
+           elevated  USN journal enumeration (whole volume in seconds) + blocking\n\
+                     tail = sub-second updates, 0 idle CPU\n\
+           fallback  no elevation: directory walk + 30s root-signature poll\n\
          \n\
          Options:\n\
            -d           folders only\n\
@@ -185,8 +375,12 @@ fn print_help() {
            -n <num>     result limit (default 200)\n\
            *            wildcard in query\n\
          \n\
-         Built-in skips: .git .svn .hg .jj .vs .idea node_modules Library Temp obj \\\n\
-         target __pycache__ .gradle .nuget .cache; extra names in \\\n\
+         Index scope: whitelist in %APPDATA%\\everything233\\include.txt\n\
+         (one root per line, drive root = whole volume, # = comment)\n\
+         Built-in skips: .git .svn .hg .jj .vs .idea .vscode node_modules Library \\\n\
+         Temp obj target __pycache__ .gradle .nuget .cache build out; \\\n\
+         system trees (Windows/Program Files/ProgramData/AppData/...) and game \\\n\
+         platforms at the drive root; extra names in \\\n\
          %APPDATA%\\everything233\\ignore.txt",
         env!("CARGO_PKG_VERSION")
     );
