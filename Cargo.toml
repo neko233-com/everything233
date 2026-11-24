@@ -1,6 +1,6 @@
 [package]
 name = "everything233"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "Everything, but faster: elevated USN-journal index (whole volume in seconds), blocking tail (0 idle CPU), 8-byte records, name-chain inverted index."
 license = "MIT"

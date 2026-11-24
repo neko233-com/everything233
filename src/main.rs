@@ -119,6 +119,72 @@ fn main() {
                 }
             }
         }
+        "walkprobe" => {
+            let d = args.get(1).cloned().unwrap_or_else(|| "D:\\".to_string());
+            println!("{d}:\n{}", index::probe_dir(&d));
+        }
+        "idprobe" => {
+            for p in &args[1..] {
+                println!("{}", index::file_id(p));
+            }
+        }
+        "build" => {
+            let roots = index::scan_roots();
+            println!("roots {roots:?}");
+            let t = std::time::Instant::now();
+            match index::build_usn(&roots) {
+                Some(i) => {
+                    println!("{} in {} ms", i.info(), t.elapsed().as_millis());
+                    for v in &i.vol {
+                        println!(
+                            "  vol {} journal {:x} next {} walk {}",
+                            v.drive as char,
+                            v.journal_id,
+                            v.next_usn,
+                            i.is_walk_vol(v.drive)
+                        );
+                    }
+                }
+                None => println!("build failed (no elevation?)"),
+            }
+        }
+        "readprobe" => {
+            let d = args.get(1).and_then(|s| s.chars().next()).unwrap_or('D');
+            let Some(mut v) = usn::open(d) else {
+                println!("no journal on {d}");
+                return;
+            };
+            println!("{d}: {} next_usn={} ver={}", usn::fs(d), v.next_usn, v.ver);
+            for (min, max) in [(2u16, 2u16), (2, 3), (3, 3)] {
+                for (wait, to) in [(0u64, 0u64), (1, 3), (4096, 3), (8192, 3), (0, 3)] {
+                    let t = std::time::Instant::now();
+                    let r = v.read_probe(min, max, 1 << 20, wait, to);
+                    println!(
+                        "  ver {min}-{max} wait {wait:<5} to {to} -> {r:?} in {} ms",
+                        t.elapsed().as_millis()
+                    );
+                }
+            }
+        }
+        "jprobe" => {
+            let d = args.get(1).and_then(|s| s.chars().next()).unwrap_or('D');
+            let ver: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(3);
+            let Some(mut v) = usn::open(d) else {
+                println!("no journal on {d}");
+                return;
+            };
+            // Create a known object after capturing the watermark, so the dump
+            // definitely contains records for a name we can recognise.
+            let start = v.next_usn;
+            let p = format!("{d}:\\__e233_probe_name_zz");
+            std::fs::create_dir_all(&p).ok();
+            std::fs::write(format!("{p}\\zz_probe_name.txt"), b"x").ok();
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            println!("{d}: {} ver {ver}\n{}", usn::fs(d), v.dump_from(start, ver));
+            println!("{}", index::file_id(&p));
+            println!("{}", index::file_id(&format!("{p}\\zz_probe_name.txt")));
+            std::fs::remove_dir_all(&p).ok();
+        }
         "readtest" => {
             let d = args
                 .get(1)
@@ -128,13 +194,27 @@ fn main() {
                 println!("no journal on {d}");
                 return;
             };
-            println!("{d}: next_usn={}", v.next_usn);
-            for i in 0..3 {
+            println!("{d}: next_usn={} poll={}", v.next_usn, v.poll);
+            for i in 0..6 {
                 let t = std::time::Instant::now();
-                let r = v.read_batch(15);
+                let r = if v.poll {
+                    // ReFS: no working blocking wait; poll like the daemon does.
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    v.read_poll()
+                } else {
+                    v.read_batch(15)
+                };
                 let ms = t.elapsed().as_millis();
                 match r {
-                    Ok(x) => println!("{i}: {ms} ms -> ok {} change(s)", x.len()),
+                    Ok(x) => {
+                        println!("{i}: {ms} ms -> ok {} change(s)", x.len());
+                        for ch in x.iter().take(3) {
+                            println!(
+                                "   {:016x} <- {:016x}  attr {:08x} rs {:08x}  {}",
+                                ch.frn, ch.parent, ch.attrs, ch.reason, ch.name
+                            );
+                        }
+                    }
                     Err(e) => println!("{i}: {ms} ms -> err {e}"),
                 }
             }
@@ -282,16 +362,22 @@ fn serve(rest: &[String]) -> ! {
 
     let idx: index::Shared = Arc::new(RwLock::new(built));
     plog(&format!("indexed {} entries", idx.read().unwrap().len()));
-    let has_walk = idx.read().unwrap().vol.iter().any(|m| m.journal_id == 0);
+    let walk_vols: Vec<u8> = {
+        let g = idx.read().unwrap();
+        g.vol.iter().map(|m| m.drive).filter(|d| g.is_walk_vol(*d)).collect()
+    };
     if vols.is_empty() {
         plog("watcher: 30s root-signature poll");
         index::spawn_poll(idx.clone());
     } else {
-        plog("journal tail active (blocking read, 0 idle CPU)");
+        plog("journal tail active (NTFS: blocking read, 0 idle CPU | ReFS: 1s poll)");
         index::spawn_usn(idx.clone(), vols);
     }
-    if has_walk {
-        plog("note: non-NTFS volume (ReFS/exFAT) has no MFT enumeration; run `everything serve --rebuild` to pick up new files");
+    if !walk_vols.is_empty() {
+        plog(&format!(
+            "note: walk-built volume(s) {:?}: one bulk directory scan at startup, journal patched live",
+            walk_vols.iter().map(|d| *d as char).collect::<Vec<_>>()
+        ));
     }
     plog("serving on \\\\.\\pipe\\everything233");
     daemon::run(idx)

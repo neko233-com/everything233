@@ -19,11 +19,13 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
-    FindClose, FindFirstFileW, FindNextFileW, GetFileAttributesExW, GetFileExInfoStandard,
-    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, WIN32_FILE_ATTRIBUTE_DATA,
-    WIN32_FIND_DATAW,
+    CreateFileW, FileIdExtdDirectoryInfo, FileIdInfo, FindClose, FindFirstFileW, FindNextFileW,
+    GetFileAttributesExW, GetFileExInfoStandard, GetFileInformationByHandleEx, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_EXTD_DIR_INFO, FILE_ID_INFO,
+    FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    WIN32_FILE_ATTRIBUTE_DATA, WIN32_FIND_DATAW,
 };
 use windows_sys::Win32::System::Threading::{
     GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_LOWEST,
@@ -74,6 +76,12 @@ pub struct Index {
     first: Vec<u32>,    // name_id -> first rec id + 1 (0 = none)
     next: Vec<u32>,     // rec id -> next rec id + 1 sharing the same name (0 = end)
     frn: Vec<u32>,      // volume-offset MFT key -> rec id + 1 (0 = absent)
+    /// ReFS/exFAT volumes get no MFT, so live patches resolve parents through
+    /// this directory file-id map instead (raw 128-bit FILE_ID -> rec id + 1).
+    /// ReFS puts the numeric id in the high half, so the full value is the key.
+    dirs: HashMap<u128, u32>,
+    /// Drives whose records came from a directory walk (journal patches use `dirs`).
+    walk: Vec<u8>,
     pub vol: Vec<VolMeta>,
     // Build-phase name map; cleared after build.
     seen: HashMap<String, u32>,
@@ -148,7 +156,7 @@ fn ft_u64(ft: &windows_sys::Win32::Foundation::FILETIME) -> u64 {
     (ft.dwHighDateTime as u64) << 32 | ft.dwLowDateTime as u64
 }
 
-// -------- cache v4 --------
+// -------- cache v6 --------
 
 impl Index {
     pub fn save(&self, p: &Path) {
@@ -159,7 +167,7 @@ impl Index {
             16 + self.names.len() + self.name_off.len() * 4 + self.recs.len() * 8,
         );
         b.extend_from_slice(b"E233");
-        b.extend_from_slice(&5u32.to_le_bytes());
+        b.extend_from_slice(&6u32.to_le_bytes());
         b.extend_from_slice(&(self.names.len() as u32).to_le_bytes());
         b.extend_from_slice(&self.names);
         b.extend_from_slice(&(self.name_off.len() as u32).to_le_bytes());
@@ -190,7 +198,13 @@ impl Index {
             b.extend_from_slice(&v.journal_id.to_le_bytes());
             b.extend_from_slice(&v.next_usn.to_le_bytes());
         }
-        if let Some(mut f) = std::fs::File::create(p).ok() {
+        b.extend_from_slice(&(self.walk.len() as u32).to_le_bytes());
+        b.extend_from_slice(&self.walk);
+        b.extend_from_slice(&(self.dirs.len() as u32).to_le_bytes());
+        for (k, v) in &self.dirs {
+            b.extend_from_slice(&k.to_le_bytes());
+            b.extend_from_slice(&v.to_le_bytes());
+        }        if let Some(mut f) = std::fs::File::create(p).ok() {
             use std::io::Write;
             let _ = f.write_all(&b);
         }
@@ -201,7 +215,7 @@ impl Index {
         if buf.len() < 8 || &buf[..4] != b"E233" {
             return None;
         }
-        if u32::from_le_bytes(buf[4..8].try_into().ok()?) != 5 {
+        if u32::from_le_bytes(buf[4..8].try_into().ok()?) != 6 {
             return None;
         }
         let mut o = 8usize;
@@ -262,6 +276,19 @@ impl Index {
                 next_usn,
             });
         }
+        let wl = u32::from_le_bytes(buf.get(o..o + 4)?.try_into().ok()?) as usize;
+        o += 4;
+        let walk = buf.get(o..o + wl)?.to_vec();
+        o += wl;
+        let dl = u32::from_le_bytes(buf.get(o..o + 4)?.try_into().ok()?) as usize;
+        o += 4;
+        let mut dirs = HashMap::with_capacity(dl);
+        for _ in 0..dl {
+            let k = u128::from_le_bytes(buf.get(o..o + 16)?.try_into().ok()?);
+            let v = u32::from_le_bytes(buf.get(o + 16..o + 20)?.try_into().ok()?);
+            o += 20;
+            dirs.insert(k, v);
+        }
         if recs.len() != next.len() || name_off.len() != first.len() {
             return None;
         }
@@ -272,6 +299,8 @@ impl Index {
             first,
             next,
             frn,
+            dirs,
+            walk,
             vol,
             seen: HashMap::new(),
         })
@@ -347,6 +376,18 @@ impl Index {
         self.recs.len()
     }
 
+    /// One-line shape of the index, for build/probe diagnostics.
+    pub fn info(&self) -> String {
+        format!(
+            "{} records, {} unique names ({} B), {} dir ids, walk {:?}",
+            self.recs.len(),
+            self.name_off.len(),
+            self.names.len(),
+            self.dirs.len(),
+            self.walk.iter().map(|d| *d as char).collect::<Vec<_>>()
+        )
+    }
+
     /// Byte-wise lowercase substring match; candidate goes into a stack buffer (no alloc).
     #[inline]
     fn name_hit_bytes(b: &[u8], segs: &[Vec<u8>], qb: &[u8], stack: &mut [u8; 512]) -> bool {
@@ -405,7 +446,12 @@ impl Index {
                 if crate::ignore::path_ignored(&path) {
                     continue;
                 }
-                let (size, mtime) = stat_path(&path);
+                // One stat per hit doubles as a liveness check: entries the journal
+                // could not patch (ReFS deletes we never saw) vanish instead of
+                // showing stale paths forever.
+                let Some((size, mtime)) = stat_path(&path) else {
+                    continue;
+                };
                 out.push(Entry {
                     path,
                     name: self.name_at(r.name_id).to_string(),
@@ -427,21 +473,58 @@ impl Index {
         out
     }
 
-    /// Apply live journal records: create / rename / delete. `base` is the
-    /// volume's MFT-number offset inside `frn`.
-    pub fn apply(&mut self, base: u32, chs: &[Change]) {
+    /// Apply live journal records for one drive.
+    ///
+    /// Two resolver modes: NTFS keys records by MFT number (`frn`, dense vector
+    /// with a per-volume base), while walked volumes (ReFS) key parents in `dirs`
+    /// by the raw 128-bit FILE_ID: ReFS stores its numeric id in the high half and
+    /// the directory enumeration reports the same 16 bytes, so both sides join.
+    pub fn apply(&mut self, drive: u8, chs: &[Change]) {
+        let by_walk = self.walk.iter().any(|d| *d == drive);
+        let base = self
+            .vol
+            .iter()
+            .find(|v| v.drive == drive)
+            .map(|v| v.base)
+            .unwrap_or(0);
+        // Same-batch rename pairing: RENAME_OLD_NAME finds the record, the
+        // following RENAME_NEW_NAME updates it in place (files have no id map).
+        let mut moved: Vec<(u128, u32)> = Vec::new();
         for ch in chs {
+            // Rename pairing key: the 128-bit id on walked volumes, MFT number else.
+            let key = if by_walk {
+                ch.frn128
+            } else {
+                usn::mft(ch.frn) as u128
+            };
+            // V2 ids pack a 16-bit sequence above the MFT index, so the raw u64
+            // cannot index the dense `frn` table — always reduce to the MFT number.
+            let k_frn = base as usize + usn::mft(ch.frn) as usize;
+            let k_par = base as usize + usn::mft(ch.parent) as usize;
             let is_dir = ch.attrs & FILE_ATTRIBUTE_DIRECTORY != 0;
-            let k = base as usize + ch.frn as usize;
-            let rid = self.frn.get(k).copied().unwrap_or(0);
+            let rid = if by_walk {
+                self.dirs.get(&ch.frn128).copied().unwrap_or(0)
+            } else {
+                self.frn.get(k_frn).copied().unwrap_or(0)
+            };
             if ch.reason & usn::REASON_FILE_DELETE != 0 {
                 if rid != 0 {
                     if let Some(r) = self.recs.get_mut((rid - 1) as usize) {
                         r.parent |= DEAD_BIT;
                     }
+                    if by_walk {
+                        self.dirs.remove(&ch.frn128);
+                    } else if let Some(s) = self.frn.get_mut(k_frn) {
+                        *s = 0;
+                    }
                 }
-                if let Some(s) = self.frn.get_mut(k) {
-                    *s = 0;
+                continue;
+            }
+            if ch.reason & usn::REASON_RENAME_OLD_NAME != 0
+                && ch.reason & usn::REASON_RENAME_NEW_NAME == 0
+            {
+                if rid != 0 {
+                    moved.push((key, rid));
                 }
                 continue;
             }
@@ -451,15 +534,25 @@ impl Index {
             if crate::ignore::skip_name(&ch.name) {
                 continue;
             }
-            let pid = self
-                .frn
-                .get(base as usize + ch.parent as usize)
-                .copied()
-                .unwrap_or(0);
+            let pid = if by_walk {
+                self.dirs.get(&ch.parent128).copied().unwrap_or(0)
+            } else {
+                self.frn.get(k_par).copied().unwrap_or(0)
+            };
             if pid == 0 {
                 // Parent pruned (ignored subtree) or not indexed: skip.
                 continue;
             }
+            let rid = if rid != 0 {
+                rid
+            } else {
+                moved
+                    .iter()
+                    .rev()
+                    .find(|(f, _)| *f == key)
+                    .map(|(_, r)| *r)
+                    .unwrap_or(0)
+            };
             let nid = self.intern(&ch.name);
             if rid != 0 {
                 let ri = (rid - 1) as usize;
@@ -472,14 +565,47 @@ impl Index {
                     self.next[ri] = self.first[nid as usize];
                     self.first[nid as usize] = rid;
                 }
-            } else {
-                let id = self.push_rec(pid - 1, is_dir, nid);
-                if k >= self.frn.len() {
-                    self.frn.resize(k + 1, 0);
+                if by_walk && is_dir {
+                    self.dirs.insert(ch.frn128, rid);
                 }
-                self.frn[k] = id + 1;
+            } else {
+                // ReFS replays CREATE for the same object (create, data extend,
+                // close...), and files carry no id in our map, so skip when an
+                // identical live (parent, name) record already exists.
+                if by_walk {
+                    let mut cur = self.first[nid as usize];
+                    let mut dup = false;
+                    while cur != 0 {
+                        let i = (cur - 1) as usize;
+                        let r = self.recs[i];
+                        cur = self.next[i];
+                        if !r.dead() && r.name_id == nid && r.parent_id() == pid - 1 {
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if dup {
+                        continue;
+                    }
+                }
+                let id = self.push_rec(pid - 1, is_dir, nid);
+                if by_walk {
+                    if is_dir {
+                        self.dirs.insert(ch.frn128, id + 1);
+                    }
+                } else {
+                    if k_frn >= self.frn.len() {
+                        self.frn.resize(k_frn + 1, 0);
+                    }
+                    self.frn[k_frn] = id + 1;
+                }
             }
         }
+    }
+
+    /// True when this drive's records came from a directory walk (ReFS/exFAT).
+    pub fn is_walk_vol(&self, drive: u8) -> bool {
+        self.walk.iter().any(|d| *d == drive)
     }
 
     pub fn sync_vol(&mut self, drive: u8, journal_id: u64, next_usn: i64) {
@@ -507,17 +633,18 @@ pub struct Entry {
 }
 
 /// One stat per returned hit (sizes/dates are not stored in the index).
-fn stat_path(p: &str) -> (u64, u32) {
+/// None = the path no longer exists (or is unreachable): drop the hit.
+fn stat_path(p: &str) -> Option<(u64, u32)> {
     let w = wide(p);
     let mut fd: WIN32_FILE_ATTRIBUTE_DATA = unsafe { std::mem::zeroed() };
     let ok = unsafe {
         GetFileAttributesExW(w.as_ptr(), GetFileExInfoStandard, &mut fd as *mut _ as *mut _)
     };
     if ok == 0 {
-        return (0, 0);
+        return None;
     }
     let size = (fd.nFileSizeHigh as u64) << 32 | fd.nFileSizeLow as u64;
-    (size, ft_to_unix(&fd.ftLastWriteTime))
+    Some((size, ft_to_unix(&fd.ftLastWriteTime)))
 }
 
 // -------- scan roots --------
@@ -611,22 +738,28 @@ pub fn build_usn(roots: &[String]) -> Option<Index> {
     for drive in drives {
         let Some(mut vol) = usn::open(drive) else { continue };
 
-        // FSCTL_ENUM_USN_DATA is NTFS-only. ReFS/exFAT volumes get a one-time
-        // walk (their journal cannot be mapped back to our 8-byte records).
+        // FSCTL_ENUM_USN_DATA is NTFS-only, but the journal is not: ReFS keeps a
+        // change journal too. So: one bulk directory walk to seed names + directory
+        // file ids, then the same blocking journal tail patches it live.
         if usn::fs(drive) != "NTFS" {
             let dr = format!("{}:", drive);
+            let mut walked = false;
             for r in roots {
                 if r.to_ascii_uppercase().starts_with(&dr) {
                     walk_root(r, &mut idx, 0);
+                    walked = true;
                 }
             }
-            idx.vol.push(VolMeta {
-                drive: drive as u8,
-                base: 0,
-                journal_id: 0,
-                next_usn: 0,
-            });
-            used += 1;
+            if walked {
+                idx.walk.push(drive as u8);
+                idx.vol.push(VolMeta {
+                    drive: drive as u8,
+                    base: 0,
+                    journal_id: vol.journal_id,
+                    next_usn: vol.next_usn,
+                });
+                used += 1;
+            }
             continue;
         }
 
@@ -869,6 +1002,151 @@ pub fn build_walk(roots: &[String]) -> Index {
 
 fn walk_root(root: &str, idx: &mut Index, depth: u32) {
     let root_id = idx.add_named(ROOT, true, root);
+    if !walk_bulk(root, root_id, depth, idx) {
+        // Old FS / API not supported here: plain FindFirstFile walk, no dir ids
+        // (live patches then cannot attach records; the 30s poll covers it).
+        walk_plain(root, root_id, depth, idx);
+    }
+}
+
+/// Bulk directory read via `GetFileInformationByHandleEx(FileIdExtdDirectoryInfo)`:
+/// one syscall returns up to a whole directory's names, attributes AND 128-bit
+/// file ids. The ids are what makes ReFS patchable live: its journal reports the
+/// parent's file id, and this is the same id space.
+fn walk_bulk(root: &str, root_id: u32, depth: u32, idx: &mut Index) -> bool {
+    let mut stack: Vec<(String, u32, u32)> = vec![(root.to_string(), root_id, depth)];
+    let mut buf = vec![0u8; 64 << 10];
+    let mut first = true;
+    let mut fails: u32 = 0;
+    while let Some((dir, parent, dep)) = stack.pop() {
+        let w = wide(&format!("\\\\?\\{dir}"));
+        let h = unsafe {
+            CreateFileW(
+                w.as_ptr(),
+                FILE_LIST_DIRECTORY,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                std::ptr::null_mut(),
+            )
+        };
+        if h == INVALID_HANDLE_VALUE {
+            if first {
+                return false;
+            }
+            continue;
+        }
+        // Only the scan root needs its id read from a handle: every other
+        // directory's 128-bit id arrives with the parent's listing, so this is
+        // one syscall total instead of one per directory.
+        if first {
+            let mut fi: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+            let got_id = unsafe {
+                GetFileInformationByHandleEx(
+                    h,
+                    FileIdInfo,
+                    &mut fi as *mut _ as *mut _,
+                    std::mem::size_of::<FILE_ID_INFO>() as u32,
+                )
+            };
+            if got_id != 0 {
+                let fid = u128::from_le_bytes(fi.FileId.Identifier);
+                if fid != 0 {
+                    idx.dirs.insert(fid, parent + 1);
+                }
+            }
+        }
+        let mut children: Vec<(String, u32, u128)> = Vec::new();
+        let mut attempt = 0u8;
+        loop {
+            let ok = unsafe {
+                GetFileInformationByHandleEx(
+                    h,
+                    FileIdExtdDirectoryInfo,
+                    buf.as_mut_ptr() as *mut _,
+                    buf.len() as u32,
+                )
+            };
+            if ok == 0 {
+                let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+                if err == 18 {
+                    break; // ERROR_NO_MORE_FILES: directory exhausted
+                }
+                if first || attempt > 0 {
+                    // Root unreadable -> no ids at all; deeper failure loses one
+                    // directory, so log it instead of silently dropping entries.
+                    if !first {
+                        fails += 1;
+                    }
+                    if first {
+                        unsafe { CloseHandle(h) };
+                        return false;
+                    }
+                    break;
+                }
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                continue;
+            }
+            let base = buf.as_ptr() as usize;
+            let mut off = 0usize;
+            loop {
+                let e = (base + off) as *const FILE_ID_EXTD_DIR_INFO;
+                let nlen = unsafe { (*e).FileNameLength } as usize / 2;
+                let attrs = unsafe { (*e).FileAttributes };
+                // FILE_ID_128 at the tail: the full 128-bit id (ReFS keeps the
+                // numeric part in the high half, so the low 64 bits are useless).
+                let fid = unsafe {
+                    std::ptr::read_unaligned(std::ptr::addr_of!((*e).FileId) as *const [u8; 16])
+                };
+                let fid = u128::from_le_bytes(fid);
+                if nlen > 0 {
+                    let nm =
+                        unsafe { std::slice::from_raw_parts(std::ptr::addr_of!((*e).FileName) as *const u16, nlen) };
+                    let name = from_wide(nm);
+                    if name != "." && name != ".." {
+                        children.push((name, attrs, fid));
+                    }
+                }
+                let next = unsafe { (*e).NextEntryOffset } as usize;
+                if next == 0 {
+                    break;
+                }
+                off += next;
+            }
+        }
+        unsafe { CloseHandle(h) };
+        first = false;
+        for (name, attrs, fid) in children {
+            let full = format!("{dir}\\{name}");
+            if crate::ignore::walk_ignored(&full) {
+                continue;
+            }
+            let is_dir = attrs & FILE_ATTRIBUTE_DIRECTORY != 0;
+            if is_dir {
+                let blocked = attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0
+                    || crate::ignore::is_ignored(&name)
+                    || (dep == 0 && crate::ignore::top_skipped(&name));
+                if !blocked {
+                    let id = idx.add_named(parent, true, &name);
+                    if fid != 0 {
+                        idx.dirs.insert(fid, id + 1);
+                    }
+                    stack.push((full, id, dep + 1));
+                }
+            } else {
+                idx.add_named(parent, false, &name);
+            }
+        }
+    }
+    if fails > 0 {
+        eprintln!("walk: {fails} director(y/ies) unreadable, entries lost there");
+    }
+    true
+}
+
+fn walk_plain(root: &str, root_id: u32, depth: u32, idx: &mut Index) {
     let mut stack: Vec<(String, u32, u32)> = vec![(root.to_string(), root_id, depth)];
     let mut budget: u32 = 0;
     while let Some((dir, parent, dep)) = stack.pop() {
@@ -910,21 +1188,99 @@ fn walk_root(root: &str, idx: &mut Index, depth: u32) {
     }
 }
 
-// -------- live refresh --------
+/// Diagnostic: which directory-information classes a filesystem accepts here.
+pub fn probe_dir(dir: &str) -> String {
+    use windows_sys::Win32::Foundation::GetLastError;
+    let mut out = String::new();
+    let w = wide(&format!("\\\\?\\{dir}"));
+    let h = unsafe {
+        CreateFileW(
+            w.as_ptr(),
+            FILE_LIST_DIRECTORY,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if h == INVALID_HANDLE_VALUE {
+        return format!("open {dir} failed err {}", unsafe { GetLastError() });
+    }
+    let mut fi: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            h,
+            FileIdInfo,
+            &mut fi as *mut _ as *mut _,
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    out.push_str(&format!(
+        "FileIdInfo ok={ok} err={} id={:02x?}\n",
+        unsafe { GetLastError() },
+        fi.FileId.Identifier
+    ));
+    let mut buf = vec![0u8; 64 << 10];
+    for (name, class) in [
+        ("FileIdExtdDirectoryInfo", FileIdExtdDirectoryInfo),
+        ("FileIdBothDirectoryInfo", 10i32),
+    ] {
+        buf.iter_mut().for_each(|b| *b = 0);
+        let ok = unsafe {
+            GetFileInformationByHandleEx(h, class, buf.as_mut_ptr() as *mut _, buf.len() as u32)
+        };
+        let err = unsafe { GetLastError() };
+        let first_len = u32::from_le_bytes(buf[0..4].try_into().unwrap_or([0; 4]));
+        out.push_str(&format!("{name} ok={ok} err={err} first_len={first_len}\n"));
+    }
+    unsafe { CloseHandle(h) };
+    out
+}
 
+/// Diagnostic: the 128-bit file id of a path, as the API reports it.
+pub fn file_id(p: &str) -> String {
+    use windows_sys::Win32::Foundation::GetLastError;
+    let w = wide(&format!("\\\\?\\{p}"));
+    let h = unsafe {
+        CreateFileW(
+            w.as_ptr(),
+            FILE_LIST_DIRECTORY,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if h == INVALID_HANDLE_VALUE {
+        return format!("{p}: open failed err {}", unsafe { GetLastError() });
+    }
+    let mut fi: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            h,
+            FileIdInfo,
+            &mut fi as *mut _ as *mut _,
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    unsafe { CloseHandle(h) };
+    if ok == 0 {
+        return format!("{p}: FileIdInfo failed err {}", unsafe { GetLastError() });
+    }
+    let id = fi.FileId.Identifier;
+    let lo = u64::from_le_bytes(id[..8].try_into().unwrap());
+    let hi = u64::from_le_bytes(id[8..].try_into().unwrap());
+    format!("{p}: lo {lo:016x} hi {hi:016x}")
+}
+
+// -------- live refresh --------
 /// Blocking journal tail: one thread per volume, kernel-side wait -> 0 idle CPU.
 pub fn spawn_usn(idx: Shared, vols: Vec<usn::Volume>) {
     for mut v in vols {
         let idx = idx.clone();
         let drive = v.drive;
-        let mut base = idx
-            .read()
-            .unwrap()
-            .vol
-            .iter()
-            .find(|m| m.drive == drive as u8)
-            .map(|m| m.base)
-            .unwrap_or(0);
         std::thread::Builder::new()
             .name(format!("usn-{drive}"))
             .spawn(move || {
@@ -933,9 +1289,22 @@ pub fn spawn_usn(idx: Shared, vols: Vec<usn::Volume>) {
                 let mut last_flush = std::time::Instant::now();
                 let dbg = std::env::var_os("E233_DBG").is_some();
                 let mut iters: u64 = 0;
+                let poll = v.poll;
                 loop {
                     let t_read = std::time::Instant::now();
-                    match v.read_batch(15) {
+                    let r = if poll {
+                        // ReFS: the kernel's blocking wait ignores Timeout and dies
+                        // with ERROR_INVALID_USER_BUFFER; a 1 s non-blocking read is
+                        // one cheap syscall and keeps the index sub-second fresh.
+                        let r = v.read_poll();
+                        if matches!(&r, Ok(c) if c.is_empty()) {
+                            std::thread::sleep(std::time::Duration::from_millis(1000));
+                        }
+                        r
+                    } else {
+                        v.read_batch(15)
+                    };
+                    match r {
                         Ok(chs) => {
                             if dbg && (iters < 40 || iters % 500 == 0) {
                                 eprintln!(
@@ -947,7 +1316,7 @@ pub fn spawn_usn(idx: Shared, vols: Vec<usn::Volume>) {
                             iters += 1;
                             if !chs.is_empty() {
                                 let mut g = idx.write().unwrap();
-                                g.apply(base, &chs);
+                                g.apply(drive as u8, &chs);
                                 g.sync_vol(drive as u8, v.journal_id, v.next_usn);
                                 dirty = true;
                             }
@@ -968,12 +1337,6 @@ pub fn spawn_usn(idx: Shared, vols: Vec<usn::Volume>) {
                                 }
                             }
                             if let Some(fresh) = build_usn(&scan_roots()) {
-                                base = fresh
-                                    .vol
-                                    .iter()
-                                    .find(|m| m.drive == drive as u8)
-                                    .map(|m| m.base)
-                                    .unwrap_or(0);
                                 *idx.write().unwrap() = fresh;
                                 dirty = true;
                             }
