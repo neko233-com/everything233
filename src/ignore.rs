@@ -1,4 +1,4 @@
-// Built-in skip list: VCS metadata, Unity/engine caches, build output.
+// Built-in skip list: VCS metadata, package/engine caches, build output, system trees.
 // Directory-name match, case-insensitive. Extra names go in
 // %APPDATA%\everything233\ignore.txt (one per line, # = comment).
 use std::collections::HashSet;
@@ -8,15 +8,30 @@ const BUILTIN: &[&str] = &[
     // VCS / SCM metadata
     ".git", ".svn", ".hg", ".jj",
     // IDE metadata
-    ".vs", ".idea",
+    ".vs", ".idea", ".vscode",
     // package manager caches
-    "node_modules",
+    "node_modules", "site-packages", ".venv", "venv", ".conda",
+    ".next", "pods", ".dart_tool",
+    ".mypy_cache", ".pytest_cache", ".tox", ".ruff_cache", ".eslintcache",
     // Unity editor caches (never source)
-    "library", "temp", "obj",
-    // Rust build output
-    "target",
-    // language caches
-    "__pycache__", ".gradle", ".nuget", ".cache",
+    "library", "temp", "obj", "logs", "saved", "crashdumps", "userdata",
+    // Rust / Java build output
+    "target", ".gradle", ".nuget", ".cache",
+    // Python bytecode
+    "__pycache__",
+    // generic build output dirs
+    "build", "out",
+];
+
+// Full-path segment prefixes (lowercased) never indexed: OS trees, package caches.
+const PREFIX: &[&str] = &[
+    r"\windows\",
+    r"\program files\",
+    r"\program files (x86)\",
+    r"\programdata\",
+    r"\appdata\",
+    r"\go\pkg\mod\",
+    r"\.cargo\registry\",
 ];
 
 static EXTRA: OnceLock<HashSet<String>> = OnceLock::new();
@@ -48,5 +63,12 @@ pub fn is_ignored(name: &str) -> bool {
 
 /// True if any path component (backslash-split) is ignored.
 pub fn path_ignored(path: &str) -> bool {
-    path.split(['\\', '/']).any(|c| !c.is_empty() && is_ignored(c))
+    let l = path.to_ascii_lowercase();
+    PREFIX.iter().any(|p| l.contains(p))
+        || l.split(['\\', '/']).any(|c| !c.is_empty() && is_ignored(c))
+}
+
+/// Build-time path filter: same rules, used while walking.
+pub fn walk_ignored(path: &str) -> bool {
+    path_ignored(path)
 }

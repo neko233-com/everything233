@@ -34,6 +34,14 @@ VS18 Community 缺 CRT 导入库，只借 BuildTools 的 libcmt/libucrt，link.e
 - src/ignore.rs — 内置跳过清单 + ignore.txt。
 - src/update.rs — 手动/自动更新 + 最快镜像路由。
 
+## 内存布局与索引格式（改动前必读）
+
+- Rec 24B：parent u32（bit31=DIR_BIT 目录标记，低31位=父id，ROOT=0x7FFF_FFFF 为盘符根）、name u32（names arena 偏移）、nlen u32、size u64、mtime u32（unix 秒，非 FILETIME）。
+- 构建期不存完整路径；命中才沿 parent 链 resolve。
+- 缓存格式 v2：magic `E233` + version=2 + names blob + recs（parent/name/nlen/size/mtime u32）+ watch_path。版本不符 load 返回 None，自动重建。
+- 忽略分两层：目录名 BUILTIN（ignore.rs）+ 完整路径 PREFIX（`\windows\` `\program files\` `\programdata\` `\appdata\` `\go\pkg\mod` `\.cargo\registry\`）。新增系统级缓存走 PREFIX，别往 BUILTIN 塞全局名。
+- 遍历死循环红线：内层 FindNextFileW 循环里禁止用 `continue` 跳过该项（会跳过 FindNextFileW 导致同项死循环），用 if 包裹。
+
 ## 更新机制（改动此处前必读）
 
 ### 手动 everything update

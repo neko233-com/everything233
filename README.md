@@ -18,8 +18,10 @@ event-driven watcher (idle CPU ~0 after the initial build).
 - `everything update` — manual check; probes GitHub mirrors by latency, picks the fastest route, downloads MSI, elevates and installs
 - `everything serve --auto-update` — background check; stages the MSI and applies automatically (UAC)
 - Wildcard `*`, `-d` folders only, `-f` files only, `-n <num>` result limit
-- Built-in skips: `.git .svn .hg .jj .vs .idea node_modules Library Temp obj target __pycache__ .gradle .nuget .cache`
+- Built-in skips (dir name): `.git .svn .hg .jj .vs .idea .vscode node_modules site-packages .venv venv .next Pods .dart_tool .mypy_cache .pytest_cache Library Temp obj Logs Saved CrashDumps target .gradle .nuget .cache __pycache__ build out`
+- System/package-cache prefixes never indexed: `Windows`, `Program Files[ (x86)]`, `ProgramData`, `AppData`, `go\pkg\mod`, `.cargo\registry`
 - Extra skip names: `%APPDATA%\everything233\ignore.txt` (one per line, `#` comment)
+- Compact arena (24B/entry, mtime unix seconds) keeps RSS low; no content scan
 - Static CRT, zero runtime DLLs
 
 ## Install (one command)

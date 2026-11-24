@@ -22,12 +22,34 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 #[derive(Clone, Copy)]
 struct Rec {
-    parent: u32, // record id; u32::MAX = drive root
-    name: u32,   // offset into names arena
+    // bit31 = is_dir; bits 0..30 = parent record id; ROOT_PARENT = drive root
+    parent: u32,
+    name: u32, // offset into names arena
     nlen: u32,
     size: u64,
-    mtime: u64, // FILETIME
-    is_dir: bool,
+    mtime: u32, // unix seconds; 0 = unknown
+}
+
+const DIR_BIT: u32 = 0x8000_0000;
+/// parent sentinel for drive roots (stored in lower 31 bits)
+const ROOT: u32 = 0x7FFF_FFFF;
+
+impl Rec {
+    fn is_dir(self) -> bool {
+        self.parent & DIR_BIT != 0
+    }
+    fn parent_id(self) -> u32 {
+        self.parent & !DIR_BIT
+    }
+    fn new(parent: u32, is_dir: bool, name: u32, nlen: u32, size: u64, mtime: u32) -> Self {
+        Rec {
+            parent: parent | (if is_dir { DIR_BIT } else { 0 }),
+            name,
+            nlen,
+            size,
+            mtime,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -62,6 +84,9 @@ impl Index {
             let _ = std::fs::create_dir_all(dir);
         }
         let Ok(mut f) = std::fs::File::create(p) else { return };
+        // magic + format version; v2 = packed Rec (dir bit in parent, mtime u32)
+        let _ = f.write_all(b"E233");
+        let _ = f.write_all(&2u32.to_le_bytes());
         let _ = f.write_all(&(self.names.len() as u32).to_le_bytes());
         let _ = f.write_all(&self.names);
         let _ = f.write_all(&(self.recs.len() as u32).to_le_bytes());
@@ -71,7 +96,6 @@ impl Index {
             let _ = f.write_all(&r.nlen.to_le_bytes());
             let _ = f.write_all(&r.size.to_le_bytes());
             let _ = f.write_all(&r.mtime.to_le_bytes());
-            let _ = f.write_all(&[r.is_dir as u8]);
         }
         let _ = f.write_all(&(self.watch_path.len() as u32).to_le_bytes());
         for (k, &v) in &self.watch_path {
@@ -89,6 +113,9 @@ impl Index {
         f.read_to_end(&mut buf).ok()?;
         let mut o = 0usize;
         let mut rd = |n: usize| -> Option<&[u8]> { let s = o; o += n; Some(&buf[s..o]) };
+        if buf.len() < 8 || &buf[..4] != b"E233" { return None; }
+        let ver = u32::from_le_bytes(rd(4)?.try_into().ok()?);
+        if ver != 2 { return None; }
         let nl = u32::from_le_bytes(rd(4)?.try_into().ok()?) as usize;
         let names = rd(nl)?.to_vec();
         let rc = u32::from_le_bytes(rd(4)?.try_into().ok()?) as usize;
@@ -98,9 +125,8 @@ impl Index {
             let name = u32::from_le_bytes(rd(4)?.try_into().ok()?);
             let nlen = u32::from_le_bytes(rd(4)?.try_into().ok()?);
             let size = u64::from_le_bytes(rd(8)?.try_into().ok()?);
-            let mtime = u64::from_le_bytes(rd(8)?.try_into().ok()?);
-            let is_dir = rd(1)?[0] != 0;
-            recs.push(Rec { parent, name, nlen, size, mtime, is_dir });
+            let mtime = u32::from_le_bytes(rd(4)?.try_into().ok()?);
+            recs.push(Rec { parent, name, nlen, size, mtime });
         }
         let wc = u32::from_le_bytes(rd(4)?.try_into().ok()?) as usize;
         let mut watch_path = HashMap::new();
@@ -124,14 +150,14 @@ impl Index {
     fn add_dir(&mut self, parent: u32, name: &str) -> u32 {
         let (off, nlen) = self.push_name(name);
         let id = self.recs.len() as u32;
-        self.recs.push(Rec { parent, name: off, nlen, size: 0, mtime: 0, is_dir: true });
+        self.recs.push(Rec::new(parent, true, off, nlen, 0, 0));
         id
     }
 
-    fn add_file(&mut self, parent: u32, name: &str, size: u64, mtime: u64) -> u32 {
+    fn add_file(&mut self, parent: u32, name: &str, size: u64, mtime: u32) -> u32 {
         let (off, nlen) = self.push_name(name);
         let id = self.recs.len() as u32;
-        self.recs.push(Rec { parent, name: off, nlen, size, mtime, is_dir: false });
+        self.recs.push(Rec::new(parent, false, off, nlen, size, mtime));
         id
     }
 
@@ -146,10 +172,10 @@ impl Index {
         for _ in 0..128 {
             let r = self.recs[cur as usize];
             parts.push(self.rec_name(r).to_string());
-            if r.parent == u32::MAX {
+            if r.parent_id() == ROOT || r.parent == u32::MAX {
                 break;
             }
-            cur = r.parent;
+            cur = r.parent_id();
         }
         parts.reverse();
         let mut path = String::new();
@@ -186,8 +212,8 @@ impl Index {
         let ql = q.to_ascii_lowercase();
         let mut out = Vec::new();
         for (id, r) in self.recs.iter().enumerate() {
-            if dir_only && !r.is_dir { continue; }
-            if file_only && r.is_dir { continue; }
+            if dir_only && !r.is_dir() { continue; }
+            if file_only && r.is_dir() { continue; }
             let nl = self.rec_name(*r).to_ascii_lowercase();
             let hit = if segments.is_empty() {
                 nl.contains(&ql)
@@ -203,9 +229,9 @@ impl Index {
             out.push(Entry {
                 path,
                 name: self.rec_name(*r).to_string(),
-                is_dir: r.is_dir,
+                is_dir: r.is_dir(),
                 size: r.size,
-                mtime: r.mtime,
+                mtime: r.mtime as u64,
             });
             if out.len() >= limit { break; }
         }
@@ -230,6 +256,12 @@ fn ft_u64(ft: &windows_sys::Win32::Foundation::FILETIME) -> u64 {
     (ft.dwHighDateTime as u64) << 32 | ft.dwLowDateTime as u64
 }
 
+// FILETIME (100ns since 1601) -> unix seconds, truncated to u32.
+fn ft_to_unix(ft: &windows_sys::Win32::Foundation::FILETIME) -> u32 {
+    let v = ft_u64(ft);
+    ((v.saturating_sub(116_444_736_000_000_000)) / 10_000_000) as u32
+}
+
 // -------- initial build: recursive walk --------
 
 pub fn build() -> Index {
@@ -244,7 +276,7 @@ pub fn build() -> Index {
 }
 
 fn walk_root(root: &str, idx: &mut Index) {
-    let root_id = idx.add_dir(u32::MAX, root);
+    let root_id = idx.add_dir(ROOT, root);
     let mut stack = vec![(root.to_string(), root_id)];
     while let Some((dir, parent)) = stack.pop() {
         let pattern = format!("\\\\?\\{dir}\\*");
@@ -256,17 +288,19 @@ fn walk_root(root: &str, idx: &mut Index) {
             let name = from_wide(&fd.cFileName);
             if name != "." && name != ".." {
                 let full = format!("{dir}\\{name}");
-                let is_dir = fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
-                if is_dir {
-                    if fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
-                        && !crate::ignore::is_ignored(&name)
-                    {
-                        let id = idx.add_dir(parent, &name);
-                        stack.push((full, id));
+                if !crate::ignore::walk_ignored(&full) {
+                    let is_dir = fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+                    if is_dir {
+                        if fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
+                            && !crate::ignore::is_ignored(&name)
+                        {
+                            let id = idx.add_dir(parent, &name);
+                            stack.push((full, id));
+                        }
+                    } else {
+                        let size = (fd.nFileSizeHigh as u64) << 32 | fd.nFileSizeLow as u64;
+                        idx.add_file(parent, &name, size, ft_to_unix(&fd.ftLastWriteTime));
                     }
-                } else {
-                    let size = (fd.nFileSizeHigh as u64) << 32 | fd.nFileSizeLow as u64;
-                    idx.add_file(parent, &name, size, ft_u64(&fd.ftLastWriteTime));
                 }
             }
             if unsafe { FindNextFileW(h, &mut fd) } == 0 { break; }
@@ -362,24 +396,23 @@ fn stat_add(full: &str, idx: &Shared) {
     let name = full.rsplit(['\\', '/']).next().unwrap_or(full).to_string();
     let is_dir = info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
     let size = (info.nFileSizeHigh as u64) << 32 | info.nFileSizeLow as u64;
-    let mtime = ft_u64(&info.ftLastWriteTime);
+    let mtime = ft_to_unix(&info.ftLastWriteTime);
     let mut g = idx.lock().unwrap();
     if let Some(&id) = g.watch_path.get(full) {
         let r = &mut g.recs[id as usize];
         r.size = size;
         r.mtime = mtime;
-        r.is_dir = is_dir;
+        r.parent = (r.parent & !DIR_BIT) | (if is_dir { DIR_BIT } else { 0 });
         return;
     }
-    let id = if is_dir { g.add_dir(u32::MAX, &name) } else { g.add_file(u32::MAX, &name, size, mtime) };
+    let id = if is_dir { g.add_dir(ROOT, &name) } else { g.add_file(ROOT, &name, size, mtime) };
     g.watch_path.insert(full.to_string(), id);
 }
 
 // -------- display helpers --------
 
-pub fn fmt_ft(ft: u64) -> String {
-    if ft == 0 { return "-".to_string(); }
-    let secs = (ft - 116_444_736_000_000_000) / 10_000_000;
+pub fn fmt_ft(secs: u64) -> String {
+    if secs == 0 { return "-".to_string(); }
     let (days, tod) = (secs / 86_400, secs % 86_400);
     let (y, m, d) = civil_from_days(days as i64);
     let (hh, mm) = (tod / 3600, (tod % 3600) / 60);
