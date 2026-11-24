@@ -3,29 +3,22 @@
 // full paths are resolved lazily for matched results.
 // Live updates = ReadDirectoryChangesW per drive root (event-driven, idle CPU ~0).
 // No content reading, no MFT/USN (needs elevation; roadmap).
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FindClose, FindFirstFileW, FindNextFileW, GetFileAttributesExW,
-    GetLogicalDrives, OPEN_EXISTING, ReadDirectoryChangesW, WIN32_FILE_ATTRIBUTE_DATA,
-    FILE_ACTION_ADDED, FILE_ACTION_MODIFIED, FILE_ACTION_REMOVED,
-    FILE_ACTION_RENAMED_NEW_NAME, FILE_ACTION_RENAMED_OLD_NAME, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY,
-    FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_INFORMATION,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileExInfoStandard,
-    WIN32_FIND_DATAW,
+    FindClose, FindFirstFileW, FindNextFileW, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_ATTRIBUTE_REPARSE_POINT, WIN32_FIND_DATAW,
 };
 
 #[derive(Clone, Copy)]
 struct Rec {
     // bit31 = is_dir; bits 0..30 = parent record id; ROOT_PARENT = drive root
     parent: u32,
-    name: u32, // offset into names arena
-    nlen: u32,
+    name_id: u32, // index into the de-duplicated name table
     size: u64,
     mtime: u32, // unix seconds; 0 = unknown
 }
@@ -41,11 +34,10 @@ impl Rec {
     fn parent_id(self) -> u32 {
         self.parent & !DIR_BIT
     }
-    fn new(parent: u32, is_dir: bool, name: u32, nlen: u32, size: u64, mtime: u32) -> Self {
+    fn new(parent: u32, is_dir: bool, name_id: u32, size: u64, mtime: u32) -> Self {
         Rec {
             parent: parent | (if is_dir { DIR_BIT } else { 0 }),
-            name,
-            nlen,
+            name_id,
             size,
             mtime,
         }
@@ -64,7 +56,13 @@ pub struct Entry {
 #[derive(Default)]
 pub struct Index {
     recs: Vec<Rec>,
+    // De-duplicated name table: u16 byte-length prefix + raw bytes; id = sequential index.
     names: Vec<u8>,
+    name_off: Vec<u32>, // id -> offset of its u16 length prefix in names
+    // Build-phase seen map; cleared after build, reused for watcher-added names only.
+    seen: HashMap<String, u32>,
+    // Tombstoned record ids (watcher deletes); never swapped out so ids stay valid.
+    dead: HashSet<u32>,
     // Only for entries added by the watcher (rare); build-time entries keep no String path.
     watch_path: HashMap<String, u32>,
 }
@@ -84,16 +82,19 @@ impl Index {
             let _ = std::fs::create_dir_all(dir);
         }
         let Ok(mut f) = std::fs::File::create(p) else { return };
-        // magic + format version; v2 = packed Rec (dir bit in parent, mtime u32)
+        // magic + format version; v3 = de-duplicated name table, Rec 20B (no nlen)
         let _ = f.write_all(b"E233");
-        let _ = f.write_all(&2u32.to_le_bytes());
+        let _ = f.write_all(&3u32.to_le_bytes());
         let _ = f.write_all(&(self.names.len() as u32).to_le_bytes());
         let _ = f.write_all(&self.names);
+        let _ = f.write_all(&(self.name_off.len() as u32).to_le_bytes());
+        for o in &self.name_off {
+            let _ = f.write_all(&o.to_le_bytes());
+        }
         let _ = f.write_all(&(self.recs.len() as u32).to_le_bytes());
         for r in &self.recs {
             let _ = f.write_all(&r.parent.to_le_bytes());
-            let _ = f.write_all(&r.name.to_le_bytes());
-            let _ = f.write_all(&r.nlen.to_le_bytes());
+            let _ = f.write_all(&r.name_id.to_le_bytes());
             let _ = f.write_all(&r.size.to_le_bytes());
             let _ = f.write_all(&r.mtime.to_le_bytes());
         }
@@ -113,20 +114,24 @@ impl Index {
         f.read_to_end(&mut buf).ok()?;
         if buf.len() < 8 || &buf[..4] != b"E233" { return None; }
         let ver = u32::from_le_bytes(buf[4..8].try_into().ok()?);
-        if ver != 2 { return None; }
+        if ver != 3 { return None; }
         let mut o = 8usize;
         let mut rd = |n: usize| -> Option<&[u8]> { let s = o; o += n; Some(&buf[s..o]) };
         let nl = u32::from_le_bytes(rd(4)?.try_into().ok()?) as usize;
         let names = rd(nl)?.to_vec();
+        let nc = u32::from_le_bytes(rd(4)?.try_into().ok()?) as usize;
+        let mut name_off = Vec::with_capacity(nc);
+        for _ in 0..nc {
+            name_off.push(u32::from_le_bytes(rd(4)?.try_into().ok()?));
+        }
         let rc = u32::from_le_bytes(rd(4)?.try_into().ok()?) as usize;
         let mut recs = Vec::with_capacity(rc);
         for _ in 0..rc {
             let parent = u32::from_le_bytes(rd(4)?.try_into().ok()?);
-            let name = u32::from_le_bytes(rd(4)?.try_into().ok()?);
-            let nlen = u32::from_le_bytes(rd(4)?.try_into().ok()?);
+            let name_id = u32::from_le_bytes(rd(4)?.try_into().ok()?);
             let size = u64::from_le_bytes(rd(8)?.try_into().ok()?);
             let mtime = u32::from_le_bytes(rd(4)?.try_into().ok()?);
-            recs.push(Rec { parent, name, nlen, size, mtime });
+            recs.push(Rec { parent, name_id, size, mtime });
         }
         let wc = u32::from_le_bytes(rd(4)?.try_into().ok()?) as usize;
         let mut watch_path = HashMap::new();
@@ -136,33 +141,49 @@ impl Index {
             let v = u32::from_le_bytes(rd(4)?.try_into().ok()?);
             watch_path.insert(k, v);
         }
-        Some(Index { recs, names, watch_path })
+        let idx = Index { recs, names, name_off, seen: HashMap::new(), dead: HashSet::new(), watch_path };
+        Some(idx)
     }
 }
 
 impl Index {
-    fn push_name(&mut self, s: &str) -> (u32, u32) {
+    /// Intern a name into the de-duplicated table; returns its id.
+    fn intern(&mut self, s: &str) -> u32 {
+        if let Some(&id) = self.seen.get(s) {
+            return id;
+        }
+        let id = self.name_off.len() as u32;
+        let b = s.as_bytes();
         let off = self.names.len() as u32;
-        self.names.extend_from_slice(s.as_bytes());
-        (off, s.len() as u32)
+        self.names.extend_from_slice(&(b.len() as u16).to_le_bytes());
+        self.names.extend_from_slice(b);
+        self.name_off.push(off);
+        self.seen.insert(s.to_string(), id);
+        id
     }
 
     fn add_dir(&mut self, parent: u32, name: &str) -> u32 {
-        let (off, nlen) = self.push_name(name);
+        let nid = self.intern(name);
         let id = self.recs.len() as u32;
-        self.recs.push(Rec::new(parent, true, off, nlen, 0, 0));
+        self.recs.push(Rec::new(parent, true, nid, 0, 0));
         id
     }
 
     fn add_file(&mut self, parent: u32, name: &str, size: u64, mtime: u32) -> u32 {
-        let (off, nlen) = self.push_name(name);
+        let nid = self.intern(name);
         let id = self.recs.len() as u32;
-        self.recs.push(Rec::new(parent, false, off, nlen, size, mtime));
+        self.recs.push(Rec::new(parent, false, nid, size, mtime));
         id
     }
 
+    fn name_at(&self, id: u32) -> &str {
+        let off = self.name_off[id as usize] as usize;
+        let nlen = u16::from_le_bytes([self.names[off], self.names[off + 1]]) as usize;
+        std::str::from_utf8(&self.names[off + 2..off + 2 + nlen]).unwrap_or("")
+    }
+
     fn rec_name(&self, r: Rec) -> &str {
-        std::str::from_utf8(&self.names[r.name as usize..r.name as usize + r.nlen as usize]).unwrap_or("")
+        self.name_at(r.name_id)
     }
 
     /// Reconstruct full path by walking the parent chain.
@@ -171,7 +192,7 @@ impl Index {
         let mut cur = id;
         for _ in 0..128 {
             let r = self.recs[cur as usize];
-            parts.push(self.rec_name(r).to_string());
+            parts.push(self.name_at(r.name_id).to_string());
             if r.parent_id() == ROOT || r.parent == u32::MAX {
                 break;
             }
@@ -190,38 +211,54 @@ impl Index {
         path
     }
 
-    pub fn remove_path(&mut self, path: &str) {
-        if let Some(&id) = self.watch_path.get(path) {
-            self.watch_path.remove(path);
-            let last = self.recs.len() - 1;
-            self.recs.swap_remove(id as usize);
-            if id as usize != last {
-                if let Some(v) = self.watch_path.values_mut().find(|v| **v == last as u32) {
-                    *v = id;
-                }
-            }
-        }
-    }
-
     pub fn len(&self) -> usize {
         self.recs.len()
     }
 
+    /// Byte-wise lowercase substring match; candidate lowercased into a stack buffer (no alloc).
+    #[inline]
+    fn name_hit(&self, r: Rec, segs: &[Vec<u8>], qb: &[u8], stack: &mut [u8; 512]) -> bool {
+        let b = self.name_at(r.name_id).as_bytes();
+        let low: &[u8] = if b.len() <= stack.len() {
+            for (d, &c) in stack[..b.len()].iter_mut().zip(b) {
+                *d = c.to_ascii_lowercase();
+            }
+            &stack[..b.len()]
+        } else {
+            // Rare long name: alloc once and compare directly.
+            let l = b.to_ascii_lowercase();
+            return if segs.is_empty() {
+                l.windows(qb.len()).any(|w| w == qb)
+            } else {
+                segs.iter().all(|s| l.windows(s.len()).any(|w| w == s))
+            };
+        };
+        if segs.is_empty() {
+            !qb.is_empty() && low.windows(qb.len()).any(|w| w == qb)
+        } else {
+            segs.iter().all(|s| low.windows(s.len()).any(|w| w == s))
+        }
+    }
+
     pub fn search(&self, q: &str, dir_only: bool, file_only: bool, limit: usize) -> Vec<Entry> {
-        let segments: Vec<&str> = q.split('*').filter(|s| !s.is_empty()).collect();
-        let ql = q.to_ascii_lowercase();
+        let segs: Vec<Vec<u8>> = q
+            .split('*')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.as_bytes().to_ascii_lowercase())
+            .collect();
+        let qb = q.as_bytes().to_ascii_lowercase();
+
         let mut out = Vec::new();
+        let mut stack = [0u8; 512];
         for (id, r) in self.recs.iter().enumerate() {
+            if out.len() >= limit { break; }
+            if self.dead.contains(&(id as u32)) { continue; }
             if dir_only && !r.is_dir() { continue; }
             if file_only && r.is_dir() { continue; }
-            let nl = self.rec_name(*r).to_ascii_lowercase();
-            let hit = if segments.is_empty() {
-                nl.contains(&ql)
-            } else {
-                segments.iter().all(|s| nl.contains(&s.to_ascii_lowercase()))
-            };
-            if !hit { continue; }
-            let path = self.watch_path.iter()
+            if !self.name_hit(*r, &segs, &qb, &mut stack) { continue; }
+            let path = self
+                .watch_path
+                .iter()
                 .find(|(_, &v)| v == id as u32)
                 .map(|(p, _)| p.clone())
                 .unwrap_or_else(|| self.resolve(id as u32));
@@ -233,7 +270,6 @@ impl Index {
                 size: r.size,
                 mtime: r.mtime as u64,
             });
-            if out.len() >= limit { break; }
         }
         out.sort_by(|a, b| {
             a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase())
@@ -264,21 +300,67 @@ fn ft_to_unix(ft: &windows_sys::Win32::Foundation::FILETIME) -> u32 {
 
 // -------- initial build: recursive walk --------
 
+// -------- scan roots: system drive only office dirs; data drives whole, top-level filtered --------
+
+/// Whitelist roots from %APPDATA%\everything233\include.txt (one root per line, # = comment).
+fn include_roots() -> Option<Vec<String>> {
+    let dir = std::env::var_os("APPDATA")?;
+    let p = Path::new(&dir).join("everything233").join("include.txt");
+    let txt = std::fs::read_to_string(p).ok()?;
+    let list: Vec<String> = txt
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| l.trim_end_matches('\\').to_string())
+        .filter(|l| Path::new(l).is_dir())
+        .collect();
+    if list.is_empty() { None } else { Some(list) }
+}
+
+pub fn scan_roots() -> Vec<String> {
+    // Whitelist file overrides everything; data drives are never scanned by default.
+    if let Some(extra) = include_roots() {
+        return extra;
+    }
+    // Default: C: office/work folders only; never the OS tree or other drives.
+    let mut roots = Vec::new();
+    if let Some(home) = std::env::var_os("USERPROFILE") {
+        let h = Path::new(&home);
+        for sub in [
+            "Desktop", "Documents", "Downloads", "OneDrive", "Favorites",
+            "Pictures", "Videos", "Music", "source", "scripts", "DoubaoWork",
+            "WPS Cloud", "WPS Cloud Files",
+        ] {
+            let p = h.join(sub);
+            if p.is_dir() {
+                roots.push(p.to_string_lossy().into_owned());
+            }
+        }
+    }
+    roots
+}
+
 pub fn build() -> Index {
     let mut idx = Index::default();
-    let drives = unsafe { GetLogicalDrives() };
-    for bit in 0u32..26 {
-        if drives & (1 << bit) == 0 { continue; }
-        let root = format!("{}:\\", (b'A' + bit as u8) as char);
-        walk_root(&root, &mut idx);
+    for root in scan_roots() {
+        walk_root(&root, &mut idx, 0);
     }
+    eprintln!(
+        "names: {} unique, {} bytes ({} records)",
+        idx.name_off.len(),
+        idx.names.len(),
+        idx.recs.len()
+    );
+    // Drop the build-phase seen map; reused empty for watcher-added names only.
+    idx.seen.clear();
+    idx.seen.shrink_to_fit();
     idx
 }
 
-fn walk_root(root: &str, idx: &mut Index) {
+fn walk_root(root: &str, idx: &mut Index, depth: u32) {
     let root_id = idx.add_dir(ROOT, root);
-    let mut stack = vec![(root.to_string(), root_id)];
-    while let Some((dir, parent)) = stack.pop() {
+    let mut stack: Vec<(String, u32, u32)> = vec![(root.to_string(), root_id, depth)];
+    while let Some((dir, parent, dep)) = stack.pop() {
         let pattern = format!("\\\\?\\{dir}\\*");
         let w = wide(&pattern);
         let mut fd = unsafe { std::mem::zeroed::<WIN32_FIND_DATAW>() };
@@ -291,11 +373,12 @@ fn walk_root(root: &str, idx: &mut Index) {
                 if !crate::ignore::walk_ignored(&full) {
                     let is_dir = fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
                     if is_dir {
-                        if fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
-                            && !crate::ignore::is_ignored(&name)
-                        {
+                        let blocked = fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+                            || crate::ignore::is_ignored(&name)
+                            || (dep == 0 && crate::ignore::top_skipped(&name));
+                        if !blocked {
                             let id = idx.add_dir(parent, &name);
-                            stack.push((full, id));
+                            stack.push((full, id, dep + 1));
                         }
                     } else {
                         let size = (fd.nFileSizeHigh as u64) << 32 | fd.nFileSizeLow as u64;
@@ -309,104 +392,51 @@ fn walk_root(root: &str, idx: &mut Index) {
     }
 }
 
-// -------- live updates: ReadDirectoryChangesW per drive root --------
+// -------- live refresh: 30s light top-level signature check; rebuild only on change --------
 
-pub fn fixed_roots() -> Vec<String> {
-    let mut roots = Vec::new();
-    let drives = unsafe { GetLogicalDrives() };
-    for bit in 0u32..26 {
-        if drives & (1 << bit) != 0 {
-            roots.push(format!("{}:\\", (b'A' + bit as u8) as char));
+/// Cheap signature of scan roots' top level; changed => a rebuild is warranted.
+fn root_sig() -> u64 {
+    let mut h: u64 = 0x9E37_79B9_7F4A_7C15;
+    for root in scan_roots() {
+        let r = root.trim_end_matches('\\');
+        let pattern = format!("\\\\?\\{r}\\*");
+        let w = wide(&pattern);
+        let mut fd = unsafe { std::mem::zeroed::<WIN32_FIND_DATAW>() };
+        let hnd = unsafe { FindFirstFileW(w.as_ptr(), &mut fd) };
+        if hnd == INVALID_HANDLE_VALUE { continue; }
+        loop {
+            let name = from_wide(&fd.cFileName);
+            if name != "." && name != ".." {
+                h = h.wrapping_add(name.len() as u64);
+                h = h.wrapping_mul(0x1000_0000_1B3);
+                h ^= ft_u64(&fd.ftLastWriteTime);
+            }
+            if unsafe { FindNextFileW(hnd, &mut fd) } == 0 { break; }
         }
+        unsafe { FindClose(hnd) };
     }
-    roots
+    h
 }
 
-pub fn spawn_watch(root: String, idx: Shared) {
+pub fn spawn_poll(idx: Shared) {
     std::thread::Builder::new()
-        .name(format!("watch-{root}"))
+        .name("poll".to_string())
         .spawn(move || {
-            let w = wide(&format!("\\\\?\\{root}"));
-            let h = unsafe {
-                CreateFileW(
-                    w.as_ptr(),
-                    FILE_LIST_DIRECTORY,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                    std::ptr::null(),
-                    OPEN_EXISTING,
-                    FILE_FLAG_BACKUP_SEMANTICS,
-                    std::ptr::null_mut(),
-                )
-            };
-            if h == INVALID_HANDLE_VALUE { return; }
-            let mut buf = vec![0u8; 64 * 1024];
+            let mut sig = root_sig();
             loop {
-                let mut returned = 0u32;
-                let ok = unsafe {
-                    ReadDirectoryChangesW(
-                        h, buf.as_mut_ptr() as *mut _, buf.len() as u32, 1,
-                        FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME,
-                        &mut returned, std::ptr::null_mut(), None,
-                    )
-                };
-                if ok == 0 { break; }
-                if returned == 0 { continue; }
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    parse_changes(&buf, returned as usize, &root, &idx);
-                }));
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                let cur = root_sig();
+                if cur != sig {
+                    sig = cur;
+                    let fresh = build();
+                    let mut g = idx.lock().unwrap();
+                    *g = fresh;
+                    drop(g);
+                    eprintln!("index refreshed (root changed)");
+                }
             }
-            unsafe { CloseHandle(h) };
         })
         .ok();
-}
-
-fn parse_changes(buf: &[u8], len: usize, root: &str, idx: &Shared) {
-    let mut off = 0usize;
-    while off < len {
-        if off + 24 > len { break; }
-        let p = unsafe { &*(buf[off..].as_ptr() as *const FILE_NOTIFY_INFORMATION) };
-        let rel = unsafe {
-            let n = (p.FileNameLength as usize / 2).min((len - off - 24) / 2);
-            let s = std::slice::from_raw_parts(p.FileName.as_ptr(), n);
-            String::from_utf16_lossy(s)
-        };
-        let full = format!("{root}{rel}");
-        if !crate::ignore::path_ignored(&full) {
-            match p.Action {
-                FILE_ACTION_ADDED | FILE_ACTION_RENAMED_NEW_NAME => stat_add(&full, idx),
-                FILE_ACTION_REMOVED | FILE_ACTION_RENAMED_OLD_NAME => {
-                    idx.lock().unwrap().remove_path(&full);
-                }
-                FILE_ACTION_MODIFIED => stat_add(&full, idx),
-                _ => {}
-            }
-        }
-        if p.NextEntryOffset == 0 { break; }
-        off += p.NextEntryOffset as usize;
-    }
-}
-
-fn stat_add(full: &str, idx: &Shared) {
-    let mut info = unsafe { std::mem::zeroed::<WIN32_FILE_ATTRIBUTE_DATA>() };
-    let w = wide(&format!("\\\\?\\{full}"));
-    let ok = unsafe {
-        GetFileAttributesExW(w.as_ptr(), GetFileExInfoStandard, &mut info as *mut _ as *mut _)
-    };
-    if ok == 0 { return; }
-    let name = full.rsplit(['\\', '/']).next().unwrap_or(full).to_string();
-    let is_dir = info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
-    let size = (info.nFileSizeHigh as u64) << 32 | info.nFileSizeLow as u64;
-    let mtime = ft_to_unix(&info.ftLastWriteTime);
-    let mut g = idx.lock().unwrap();
-    if let Some(&id) = g.watch_path.get(full) {
-        let r = &mut g.recs[id as usize];
-        r.size = size;
-        r.mtime = mtime;
-        r.parent = (r.parent & !DIR_BIT) | (if is_dir { DIR_BIT } else { 0 });
-        return;
-    }
-    let id = if is_dir { g.add_dir(ROOT, &name) } else { g.add_file(ROOT, &name, size, mtime) };
-    g.watch_path.insert(full.to_string(), id);
 }
 
 // -------- display helpers --------

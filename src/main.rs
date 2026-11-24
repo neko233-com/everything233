@@ -104,9 +104,7 @@ fn serve(rest: &[String]) -> ! {
     };
     let idx: index::Shared = Arc::new(Mutex::new(built));
     eprintln!("indexed {} entries", idx.lock().unwrap().len());
-    for root in index::fixed_roots() {
-        index::spawn_watch(root, idx.clone());
-    }
+    index::spawn_poll(idx.clone());
     eprintln!("serving on \\\\.\\pipe\\everything233");
     daemon::run(idx)
 }
@@ -155,7 +153,7 @@ fn print_help() {
          \n\
          Usage:\n\
            everything <query>      search via daemon; on-the-fly build if daemon absent\n\
-           everything serve        load/build index, watch changes, answer pipe queries\n\
+           everything serve        load/build index, answer pipe queries (30s light refresh)\n\
            everything serve --rebuild   force full rebuild, rewrite cache\n\
            everything install     register daemon at logon (HKCU Run, no admin)\n\
            everything uninstall   unregister daemon\n\

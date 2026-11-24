@@ -17,6 +17,11 @@ const BUILTIN: &[&str] = &[
     "library", "temp", "obj", "logs", "saved", "crashdumps", "userdata",
     // Rust / Java build output
     "target", ".gradle", ".nuget", ".cache",
+    // bootstrap tool caches inside office folders
+    ".rust-bootstrap",
+    ".python-bootstrap",
+    ".node-bootstrap",
+    ".deno-bootstrap",
     // Python bytecode
     "__pycache__",
     // generic build output dirs
@@ -32,6 +37,26 @@ const PREFIX: &[&str] = &[
     r"\appdata\",
     r"\go\pkg\mod\",
     r"\.cargo\registry\",
+    r"\cargo\registry\",
+    r"\node_modules\",
+];
+
+// Top-level directory names on data drives that are never entered: game platforms,
+// downloaders, caches, temp, recycle bin, backups. Matched case-insensitively on the
+// first level under a scanned drive root only.
+const TOP_SKIP: &[&str] = &[
+    // game platforms & libraries
+    "steam", "steamlibrary", "steamapps", "wegame", "wegameapps", "taptap",
+    "qldownload", "qldownloadgame", "mihoyo-games", "mihoyo", "epic games",
+    "riot games", "battle.net", "xbox", "gog galaxy", "origin games",
+    "ubisoft", "uplay", "epic", "game", "games",
+    // caches / temp / downloaders / logs
+    "cache", "qycache", "tmp", "temp", "ttnet", "mailmasterdata", "logs",
+    "log", "wechat_logs", "nvidia corporation", "nvidia", "crashdumps",
+    "$recycle.bin", "system volume information", "recovery", "config.msi",
+    "msocache", "baidu netdiskdownload", "baidunetdiskdownload",
+    // backups (bulk, not search targets)
+    "backups", "backup", "_backup",
 ];
 
 static EXTRA: OnceLock<HashSet<String>> = OnceLock::new();
@@ -59,6 +84,11 @@ fn extra() -> &'static HashSet<String> {
 pub fn is_ignored(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     BUILTIN.contains(&n.as_str()) || extra().contains(&n)
+}
+
+/// Data-drive top-level dir to skip entirely (game platforms, caches, temp, backups).
+pub fn top_skipped(name: &str) -> bool {
+    TOP_SKIP.contains(&name.to_ascii_lowercase().as_str())
 }
 
 /// True if any path component (backslash-split) is ignored.
