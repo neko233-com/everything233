@@ -111,11 +111,11 @@ impl Index {
         let mut f = std::fs::File::open(p).ok()?;
         let mut buf = Vec::new();
         f.read_to_end(&mut buf).ok()?;
-        let mut o = 0usize;
-        let mut rd = |n: usize| -> Option<&[u8]> { let s = o; o += n; Some(&buf[s..o]) };
         if buf.len() < 8 || &buf[..4] != b"E233" { return None; }
-        let ver = u32::from_le_bytes(rd(4)?.try_into().ok()?);
+        let ver = u32::from_le_bytes(buf[4..8].try_into().ok()?);
         if ver != 2 { return None; }
+        let mut o = 8usize;
+        let mut rd = |n: usize| -> Option<&[u8]> { let s = o; o += n; Some(&buf[s..o]) };
         let nl = u32::from_le_bytes(rd(4)?.try_into().ok()?) as usize;
         let names = rd(nl)?.to_vec();
         let rc = u32::from_le_bytes(rd(4)?.try_into().ok()?) as usize;
