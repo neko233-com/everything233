@@ -5,13 +5,31 @@ mod reg;
 mod update;
 
 use std::os::windows::ffi::OsStrExt;
-use std::sync::{Arc, Mutex};
 
-use windows_sys::Win32::Foundation::CloseHandle;
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
 use windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW;
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, CREATE_NO_WINDOW, DETACHED_PROCESS, PROCESS_INFORMATION, STARTUPINFOW,
+    CreateMutexW, CreateProcessW, CREATE_NO_WINDOW, DETACHED_PROCESS, PROCESS_INFORMATION,
+    STARTUPINFOW,
 };
+
+/// Bail out if another daemon already holds the single-instance mutex.
+/// Prevents a second resident copy doubling RSS (observed 2x123MB).
+fn single_instance() {
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+    let name: Vec<u16> = std::ffi::OsStr::new("everything233-single")
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let m = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    unsafe {
+        if !m.is_null() && GetLastError() == ERROR_ALREADY_EXISTS {
+            eprintln!("everything daemon already running; exiting");
+            std::process::exit(0);
+        }
+    }
+    // Mutex handle stays open for process lifetime; OS releases it on exit.
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -83,6 +101,7 @@ fn detach_self() {
 }
 
 fn serve(rest: &[String]) -> ! {
+    single_instance();
     if rest.iter().any(|a| a == "--background") {
         detach_self();
     }
@@ -102,8 +121,8 @@ fn serve(rest: &[String]) -> ! {
             i
         }
     };
-    let idx: index::Shared = Arc::new(Mutex::new(built));
-    eprintln!("indexed {} entries", idx.lock().unwrap().len());
+    let idx = index::Shared::new(built);
+    eprintln!("indexed {} entries", idx.view().len());
     index::spawn_poll(idx.clone());
     eprintln!("serving on \\\\.\\pipe\\everything233");
     daemon::run(idx)

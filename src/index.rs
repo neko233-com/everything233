@@ -6,12 +6,16 @@
 use std::collections::{HashMap, HashSet};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::Arc;
 
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::Storage::FileSystem::{
     FindClose, FindFirstFileW, FindNextFileW, FILE_ATTRIBUTE_DIRECTORY,
     FILE_ATTRIBUTE_REPARSE_POINT, WIN32_FIND_DATAW,
+};
+use windows_sys::Win32::System::Threading::{
+    GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
 };
 
 #[derive(Clone, Copy)]
@@ -67,7 +71,32 @@ pub struct Index {
     watch_path: HashMap<String, u32>,
 }
 
-pub type Shared = Arc<Mutex<Index>>;
+/// Lock-free published index: readers take an Acquire snapshot with no lock;
+/// a rebuild atomically swaps the pointer and drops the old Index.
+#[derive(Clone)]
+pub struct Shared {
+    inner: Arc<AtomicPtr<Index>>,
+}
+
+unsafe impl Send for Shared {}
+unsafe impl Sync for Shared {}
+
+impl Shared {
+    pub fn new(idx: Index) -> Self {
+        let ptr = Arc::into_raw(Arc::new(idx)).cast_mut();
+        Self { inner: Arc::new(AtomicPtr::new(ptr)) }
+    }
+    /// Read-only snapshot; zero locking on the query path.
+    pub fn view(&self) -> &Index {
+        unsafe { &*self.inner.load(Ordering::Acquire) }
+    }
+    /// Publish a fresh Index and release the previous generation.
+    pub fn swap(&self, fresh: Index) {
+        let new = Arc::into_raw(Arc::new(fresh)).cast_mut();
+        let old = self.inner.swap(new, Ordering::AcqRel);
+        unsafe { drop(Arc::from_raw(old)); }
+    }
+}
 
 pub fn cache_path() -> Option<PathBuf> {
     std::env::var_os("LOCALAPPDATA").map(|d| {
@@ -311,8 +340,8 @@ fn include_roots() -> Option<Vec<String>> {
         .lines()
         .map(|l| l.trim())
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(|l| l.trim_end_matches('\\').to_string())
         .filter(|l| Path::new(l).is_dir())
+        .map(|l| l.to_string())
         .collect();
     if list.is_empty() { None } else { Some(list) }
 }
@@ -341,6 +370,8 @@ pub fn scan_roots() -> Vec<String> {
 }
 
 pub fn build() -> Index {
+    // Background-grade priority: a full-disk walk must not preempt the foreground.
+    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
     let mut idx = Index::default();
     for root in scan_roots() {
         walk_root(&root, &mut idx, 0);
@@ -360,6 +391,7 @@ pub fn build() -> Index {
 fn walk_root(root: &str, idx: &mut Index, depth: u32) {
     let root_id = idx.add_dir(ROOT, root);
     let mut stack: Vec<(String, u32, u32)> = vec![(root.to_string(), root_id, depth)];
+    let mut budget: u32 = 0;
     while let Some((dir, parent, dep)) = stack.pop() {
         let pattern = format!("\\\\?\\{dir}\\*");
         let w = wide(&pattern);
@@ -385,6 +417,12 @@ fn walk_root(root: &str, idx: &mut Index, depth: u32) {
                         idx.add_file(parent, &name, size, ft_to_unix(&fd.ftLastWriteTime));
                     }
                 }
+                // Yield the CPU every ~4k entries so a full-disk walk never
+                // pins one core / starves the foreground.
+                budget += 1;
+                if budget & 0xFFF == 0 {
+                    std::thread::yield_now();
+                }
             }
             if unsafe { FindNextFileW(h, &mut fd) } == 0 { break; }
         }
@@ -398,8 +436,7 @@ fn walk_root(root: &str, idx: &mut Index, depth: u32) {
 fn root_sig() -> u64 {
     let mut h: u64 = 0x9E37_79B9_7F4A_7C15;
     for root in scan_roots() {
-        let r = root.trim_end_matches('\\');
-        let pattern = format!("\\\\?\\{r}\\*");
+        let pattern = format!("\\\\?\\{root}\\*");
         let w = wide(&pattern);
         let mut fd = unsafe { std::mem::zeroed::<WIN32_FIND_DATAW>() };
         let hnd = unsafe { FindFirstFileW(w.as_ptr(), &mut fd) };
@@ -429,9 +466,7 @@ pub fn spawn_poll(idx: Shared) {
                 if cur != sig {
                     sig = cur;
                     let fresh = build();
-                    let mut g = idx.lock().unwrap();
-                    *g = fresh;
-                    drop(g);
+                    idx.swap(fresh);
                     eprintln!("index refreshed (root changed)");
                 }
             }

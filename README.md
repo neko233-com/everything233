@@ -12,7 +12,9 @@ a built-in skip list, and a 30s light root-signature refresh (idle CPU ~0 after 
 ## Features
 
 - `everything <query>` — instant lookup via the resident daemon
-- `everything serve` — load cached index, answer pipe queries; 30s light root-signature refresh; `--rebuild` forces a full rescan
+- `everything serve` — load cached index, answer pipe queries; 30s light root-signature refresh; `--rebuild` forces a full rescan; single instance (second launch exits)
+- Lock-free snapshot: queries read an Acquire atomic pointer with no lock; rebuild swaps generations in place
+- Idle CPU ~0: no resident change handle, no background scan; rebuilds run below-normal priority with yield throttling
 - Index cache at `%LOCALAPPDATA%\everything233\index.dat` — second start is instant
 - `everything install` / `uninstall` — HKCU Run-key logon auto-start (no admin)
 - `everything update` — manual check; probes GitHub mirrors by latency, picks the fastest route, downloads MSI, elevates and installs
@@ -21,7 +23,7 @@ a built-in skip list, and a 30s light root-signature refresh (idle CPU ~0 after 
 - Built-in skips (dir name): `.git .svn .hg .jj .vs .idea .vscode node_modules site-packages .venv venv .next Pods .dart_tool .mypy_cache .pytest_cache Library Temp obj Logs Saved CrashDumps target .gradle .nuget .cache __pycache__ build out`
 - System/package-cache prefixes never indexed: `Windows`, `Program Files[ (x86)]`, `ProgramData`, `AppData`, `go\pkg\mod`, `.cargo\registry`
 - Extra skip names: `%APPDATA%\everything233\ignore.txt` (one per line, `#` comment)
-- Whitelist roots: `%APPDATA%\everything233\include.txt` (one root per line, `#` comment); missing = C: office folders only. System/temp/game/cache trees never indexed
+- Whitelist roots: `%APPDATA%\everything233\include.txt` (one root per line, `#` comment); drive roots like `D:\` allowed; missing = C: office folders only. System/temp/game libraries/cache/temp/backup trees skipped
 - Compact arena (20B/entry, mtime unix seconds); filenames deduplicated into a shared blob; no content scan
 - Static CRT, zero runtime DLLs
 

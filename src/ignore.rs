@@ -43,18 +43,21 @@ const PREFIX: &[&str] = &[
 
 // Top-level directory names on data drives that are never entered: game platforms,
 // downloaders, caches, temp, recycle bin, backups. Matched case-insensitively on the
-// first level under a scanned drive root only.
+// first level under a scanned drive root only. NOTE: keep names precise — bare
+// "game"/"games" would block real project folders like GameApp/GameVideos.
 const TOP_SKIP: &[&str] = &[
-    // game platforms & libraries
+    // game platforms & libraries (exact platform names only)
     "steam", "steamlibrary", "steamapps", "wegame", "wegameapps", "taptap",
     "qldownload", "qldownloadgame", "mihoyo-games", "mihoyo", "epic games",
     "riot games", "battle.net", "xbox", "gog galaxy", "origin games",
-    "ubisoft", "uplay", "epic", "game", "games",
+    "ubisoft", "uplay", "epic",
     // caches / temp / downloaders / logs
     "cache", "qycache", "tmp", "temp", "ttnet", "mailmasterdata", "logs",
     "log", "wechat_logs", "nvidia corporation", "nvidia", "crashdumps",
     "$recycle.bin", "system volume information", "recovery", "config.msi",
     "msocache", "baidu netdiskdownload", "baidunetdiskdownload",
+    // program trees that also appear on data drives
+    "program files", "program files (x86)", "programdata",
     // backups (bulk, not search targets)
     "backups", "backup", "_backup",
 ];

@@ -81,7 +81,7 @@ fn serve_one(pipe: HANDLE, idx: &Shared) {
     let dir_only = flags == "d";
     let file_only = flags == "f";
 
-    let entries = idx.lock().unwrap().search(&q, dir_only, file_only, limit);
+    let entries = idx.view().search(&q, dir_only, file_only, limit);
     let mut out = format!("{} result(s) for \"{q}\"\n", entries.len());
     for e in &entries {
         let size = if e.is_dir {

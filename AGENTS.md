@@ -28,7 +28,8 @@ VS18 Community 缺 CRT 导入库，只借 BuildTools 的 libcmt/libucrt，link.e
 ## 代码结构
 
 - src/main.rs — CLI 分发：serve / install / uninstall / update / query；detach_self 后台分离。
-- src/index.rs — arena 紧凑索引（只存父子链+名字，命中才回溯拼路径），build 全量遍历；后台 30s 仅做根顶层签名比对，变化才重建，无常驻变更句柄。
+- src/index.rs — arena 紧凑索引（父子链+名字，命中回溯拼路径）。Shared 无锁：`AtomicPtr<Index>` 发布快照，查询 Acquire 读零锁，重建 `swap` 后 drop 旧代，不用 Mutex/RwLock。build 降线程优先级(BELOW_NORMAL)且每 ~4k 项 yield_now 让出；后台 30s 仅根顶层签名比对，变化才低优先级重建，无常驻变更句柄。
+- 单例：serve 开头 CreateMutexW(`everything233-single`)，`ERROR_ALREADY_EXISTS(183)` 即退出，杜绝双 daemon 翻倍 RSS。
 - src/daemon.rs — 命名管道 \\.\pipe\everything233，请求 query\nlimit\nflags，UTF-16 收发。
 - src/reg.rs — HKCU Run 自注册（无需管理员）。
 - src/ignore.rs — 内置跳过清单 + ignore.txt。
@@ -36,7 +37,7 @@ VS18 Community 缺 CRT 导入库，只借 BuildTools 的 libcmt/libucrt，link.e
 
 ## 扫描范围（改动前必读）
 
-- 白名单制，不整盘扫。`scan_roots()`：`%APPDATA%\everything233\include.txt` 存在则逐行作为扫描根（# 注释）；缺省只扫 C: 用户办公目录（Desktop/Documents/Downloads/OneDrive/Favorites/Pictures/Videos/Music/source/scripts/DoubaoWork/WPS Cloud）。
+- 白名单制。`scan_roots()`：`%APPDATA%\everything233\include.txt` 逐行为扫描根（# 注释），支持盘符根（`D:\`）；缺省只扫 C: 用户办公目录（Desktop/Documents/Downloads/OneDrive/Favorites/Pictures/Videos/Music/source/scripts/DoubaoWork/WPS Cloud）。盘符根第一层由精确 TOP_SKIP 挡游戏库/缓存/临时/备份（勿用裸 game/games，会误伤 GameApp 等项目目录）。
 - C: 系统树、其他盘、游戏库/缓存/临时/备份一律不进索引；数据盘不再整盘遍历。
 - 忽略分两层：目录名 BUILTIN（ignore.rs）+ 完整路径 PREFIX（`\windows\` `\program files\` `\programdata\` `\appdata\` `\go\pkg\mod` `\.cargo\registry\` `\cargo\registry` `\node_modules`）。新增系统级缓存走 PREFIX，别往 BUILTIN 塞全局名。
 
